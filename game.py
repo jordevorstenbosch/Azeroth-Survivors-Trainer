@@ -41,7 +41,7 @@ from contextlib import contextmanager, nullcontext
 import psutil
 
 APP_NAME = 'Azeroth Survivors Trainer'
-VERSION = '2.1.3'
+VERSION = '2.1.4'
 REPO = 'nelbin4/Azeroth-Survivors-Trainer'
 UPDATE_FILES = ('game.py', 'profile.example.json', 'requirements.txt', 'README.md', 'CHANGELOG.md', 'LICENSE', 'docs/TECHNICAL_NOTES.md')
 USER_FILES = ()  # files users edit by hand: an update never overwrites an existing copy
@@ -79,6 +79,8 @@ class StopSignal:
     def __exit__(self,*_):self.close()
 
 class AutoBlocked(RuntimeError):pass
+
+CORE_OWNERSHIP_BLOCKED = 'Automatic stat writes are blocked for this game build because the trainer cannot verify which character is yours.'
 
 def launch_game(executable):
     """Start the configured game once, with its install folder as the working directory."""
@@ -852,7 +854,8 @@ class AutoBackend:
         self.injected.clear();self.backed_up.clear()
         self.core_pending=[];self.core_snap=None  # a new run: candidates found before are not trusted
     def apply(self,candidate):
-        if self.core:return self.core_apply(candidate)
+        if self.core:
+            raise AutoBlocked(CORE_OWNERSHIP_BLOCKED)
         result=self.apply_once(candidate)
         if self.recipe.get('no_owner'):self.hold(candidate['base'],.4)  # these stats are recalculated every couple of seconds: pin them between steps
         return result
@@ -927,6 +930,9 @@ class AutoRecovery:
                 self.generation=None;self.forget();self.state=dict(state='waiting_process');return self.state
             if generation!=self.generation:
                 self.backend.bind(generation);self.generation=generation;self.forget()
+            if getattr(self.backend,'core',False):
+                self.state=dict(state='blocked',reason=CORE_OWNERSHIP_BLOCKED,candidates=0)
+                return self.state
             if getattr(self.backend,'learning',False):
                 self.state=self.backend.learn(now);return self.state
             if self.candidate is None:
@@ -955,17 +961,14 @@ class AutoRecovery:
             values=fresh.get('values',{});previous=self.last_values
             gold_gain='Gold Wallet' in values and 'Gold Wallet' in previous and values['Gold Wallet']>previous['Gold Wallet']
             damage=all(k in values and k in previous for k in ('Max Health','Current Health')) and values['Max Health']==previous['Max Health'] and values['Current Health']<previous['Current Health']
-            if getattr(self.backend,'core',False) and not reset:self.active=True;self.last_progress=now  # pattern-found record: apply at once
-            elif not reset and (fresh['level']>self.baseline or gold_gain or damage):
+            if not reset and (fresh['level']>self.baseline or gold_gain or damage):
                 self.active=True;self.baseline=fresh['level'];self.last_progress=now
             self.last_values=dict(values)
             if now-self.last_progress>120:self.active=False
             if not self.low:self.last_level=fresh['level']
             self.candidate=fresh
             self.state=dict(state='waiting_progress',level=self.last_level,run=self.run,player_id=fresh['player_id'],base=hex(fresh['base']))
-            if getattr(self.backend,'core',False) and hasattr(self.backend,'refresh_scene'):self.backend.refresh_scene(now)  # keep the lobby/run reading fresh (every 10 s)
-            in_run=getattr(self.backend,'scene',None) not in (None,'lobby','menu')  # never write in the lobby or menu, even while hosting
-            if self.active and self.confirmations>=2 and not self.low and (in_run or not getattr(self.backend,'core',False)):  # no writes while a possible reset is unconfirmed
+            if self.active and self.confirmations>=2 and not self.low:  # no writes while a possible reset is unconfirmed
                 result=self.backend.apply(fresh);self.total_writes+=result['writes']
                 self.state.update(state='applying',last_batch=result['writes'],total_field_writes=self.total_writes,values=result.get('values',{}))
             self.failures=0
@@ -1029,7 +1032,7 @@ def auto_command():
             engine=AutoRecovery(backend)
             while time.monotonic()<deadline and not signal.wait(0):
                 state=engine.step()
-                if engine.generation and engine.generation!=talents_done[0] and not args.trace_only and state.get('state') not in ('waiting_process','starting'):
+                if engine.generation and engine.generation!=talents_done[0] and not args.trace_only and state.get('state') not in ('waiting_process','starting','blocked'):
                     talents_done[0]=engine.generation
                     if read().get('talent_auto',False):
                         cap=read().get('talent_cap',TALENT_DEFAULT_CAP)
@@ -3284,7 +3287,7 @@ class WatcherWindow:
         self.refresh()
         threading.Thread(target=self.check_update,daemon=True).start()  # the window is already up; a slow GitHub check never delays it
         if not configured():root.after(400,self.locate_game)  # first run: the window is up, now ask where the game is
-        elif not auto_alive(read()):root.after(800,self.start)  # starts automatically with the window, in the selected mode
+        elif '--no-autostart' not in sys.argv and not auto_alive(read()):root.after(800,self.start)
     def check_update(self):
         newer=remote_version()
         if newer:self.update_found=newer  # refresh() shows the Update button on the window thread
@@ -3703,11 +3706,15 @@ def self_test():
             for _ in range(5):self.assertEqual(engine.step()['state'],'blocked_ambiguous')  # nothing moves: stay blocked
             for index in range(5):hp[0]-=1;clock[0]+=1;state=engine.step()
             self.assertNotEqual(state['state'],'blocked_ambiguous');self.assertEqual(engine.candidate['base'],backend.base)
-        def test_unverified_core_build_discovers_but_writes_nothing(self):
+        def test_core_cannot_write_to_the_only_record_that_moves(self):
             backend,clock,engine=self.recovery_fixture();backend.core=True;backend.build='some-other-build'
-            backend.seek=lambda now:[]
-            state=engine.step()
-            self.assertNotEqual(state['state'],'blocked')
+            backend.seek=lambda now:[dict(backend.sample(),name='Party member')]
+            for level in range(1,4):
+                backend.level=level;clock[0]+=1
+                state=engine.step()
+                self.assertEqual(state['state'],'blocked')
+                self.assertEqual(state['reason'],CORE_OWNERSHIP_BLOCKED)
+                self.assertIsNone(engine.candidate)
             self.assertEqual(backend.writes,[])
         def test_target_rules_are_shared(self):
             self.assertIsNotNone(target_relations_problem({0:0.5}))
