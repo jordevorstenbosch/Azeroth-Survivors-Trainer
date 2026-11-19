@@ -294,26 +294,17 @@ impl Window {
         self.child(hwnd, "STATIC", &description, 0, [43, 98, 390, 36], 0);
 
         let build = self.build.clone().unwrap_or_else(|| "—".into());
-        let name = self
-            .reading
-            .name
-            .clone()
-            .unwrap_or_else(|| "Not detected".into());
-        let visible = self
-            .reading
-            .stats
-            .iter()
-            .take(2)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("  ·  ");
+        let mut visible = self.reading.stats.chunks(2);
+        let first = visible
+            .next()
+            .map_or_else(|| "—".into(), |row| row.join("  ·  "));
+        let second = visible
+            .next()
+            .map_or_else(String::new, |row| row.join("  ·  "));
         let rows = [
             ("Game build", build.as_str()),
-            ("Character nameplate", &name),
-            (
-                "Visible stats",
-                if visible.is_empty() { "—" } else { &visible },
-            ),
+            ("Visible stats", &first),
+            ("", &second),
             ("Stats applied", "0"),
         ];
         for (index, (label, value)) in rows.into_iter().enumerate() {
@@ -514,7 +505,6 @@ impl Window {
                     match scan.reading {
                         Ok(reading) => {
                             refreshed |= self.capture_error.take().is_some()
-                                || self.reading.name != reading.name
                                 || self.reading.stats != reading.stats;
                             if refreshed && !reading.stats.is_empty() {
                                 self.log(&format!("Visible values: {}", reading.stats.join(", ")));

@@ -28,7 +28,6 @@ use windows_sys::Win32::{
 
 #[derive(Default)]
 pub struct Reading {
-    pub name: Option<String>,
     pub stats: Vec<String>,
 }
 
@@ -122,7 +121,7 @@ fn read_accessibility(pid: u32) -> windows::core::Result<Reading> {
         if stats.len() < 2 {
             stats.clear();
         }
-        Ok(Reading { name: None, stats })
+        Ok(Reading { stats })
     }
 }
 
@@ -131,9 +130,8 @@ fn read_ocr(pid: u32) -> Result<Reading, String> {
     let _apartment = Apartment::enter().map_err(|error| error.to_string())?;
     let engine =
         OcrEngine::TryCreateFromUserProfileLanguages().map_err(|error| error.to_string())?;
-    let name = read_name(&engine, &frame);
     let stats = read_stat_panels(&engine, frame).map_err(|error| error.to_string())?;
-    Ok(Reading { name, stats })
+    Ok(Reading { stats })
 }
 
 fn read_stat_panels(engine: &OcrEngine, frame: Frame) -> windows::core::Result<Vec<String>> {
@@ -173,38 +171,6 @@ fn read_stat_panels(engine: &OcrEngine, frame: Frame) -> windows::core::Result<V
         stats.clear();
     }
     Ok(stats)
-}
-
-fn read_name(engine: &OcrEngine, frame: &Frame) -> Option<String> {
-    // The frame is half the client width, so double the full-window proportions.
-    let left = frame.width * 112 / 1000;
-    let right = frame.width * 260 / 1000;
-    let top = frame.height * 33 / 1000;
-    let bottom = frame.height * 52 / 1000;
-    let width = (right - left) * 4;
-    let height = (bottom - top) * 4;
-    let mut pixels = Vec::with_capacity(width * height * 4);
-    for y in 0..height {
-        for x in 0..width {
-            let index = ((top + y / 4) * frame.width + left + x / 4) * 4;
-            pixels.extend_from_slice(&frame.pixels[index..index + 4]);
-        }
-    }
-    let lines = recognize(engine, &pixels, width, height)
-        .ok()?
-        .Lines()
-        .ok()?;
-    if lines.Size().ok()? != 1 {
-        return None;
-    }
-    let text = lines.GetAt(0).ok()?.Text().ok()?.to_string_lossy();
-    let candidate = text.trim();
-    let mut chars = candidate.chars();
-    (candidate.len() <= 24
-        && candidate.chars().count() >= 3
-        && chars.next().is_some_and(char::is_alphabetic)
-        && chars.all(|c| c.is_alphanumeric() || c == '-' || c == '\''))
-    .then(|| candidate.to_owned())
 }
 
 fn recognize(
