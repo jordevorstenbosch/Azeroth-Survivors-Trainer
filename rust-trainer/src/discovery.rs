@@ -28,38 +28,72 @@ use windows_sys::Win32::{
 const CHUNK: usize = 512 * 1024;
 const NAME_REACH: usize = 1536;
 const STAT_BYTES: usize = 32;
+const TARGET_FIELD_BYTES: usize = 56;
 const LEVEL_DISTANCE: usize = 104;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const VERIFIED_BUILD: &str = "ba09f96a327cadc24371b9dd8d876418c8d6dde298847fab318847be8c44cc5a";
 
-struct Target {
+pub struct Target {
+    pub name: &'static str,
+    panel_label: &'static str,
     offset: usize,
     value: f32,
+    baseline: f32,
 }
 
-const TARGETS: [Target; 4] = [
+impl Target {
+    pub fn displayed_bonus(&self) -> String {
+        format!("{:+.0}%", (self.value - self.baseline) * 100.0)
+    }
+
+    pub fn panel_value(&self, readings: &[String]) -> Option<f32> {
+        let percent = readings
+            .iter()
+            .find_map(|stat| stat.strip_prefix(self.panel_label)?.strip_prefix(' '))?
+            .strip_suffix('%')?
+            .parse::<f32>()
+            .ok()?;
+        let value = self.baseline + percent / 100.0;
+        (0.0..=1e6).contains(&value).then_some(value)
+    }
+}
+
+pub type ActiveStats = [bool; 4];
+pub const TARGETS: [Target; 4] = [
     Target {
+        name: "Damage",
+        panel_label: "Damage",
         offset: 4,
         value: 100.99,
+        baseline: 1.0,
     },
     Target {
+        name: "Area",
+        panel_label: "Area",
         offset: 44,
         value: 100.99,
+        baseline: 1.0,
     },
     Target {
+        name: "Luck",
+        panel_label: "Luck",
         offset: 48,
         value: 99.99,
+        baseline: 0.0,
     },
     Target {
+        name: "Gold Bonus",
+        panel_label: "Gold",
         offset: 52,
         value: 100.99,
+        baseline: 1.0,
     },
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub build: String,
-    pub freezing: bool,
+    pub active: ActiveStats,
 }
 
 pub struct Job {
@@ -74,7 +108,6 @@ impl Job {
         instance: game::ProcessInstance,
         character: String,
         observed: Option<hud::Player>,
-        named_override: bool,
     ) -> io::Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -96,23 +129,29 @@ impl Job {
                     }
                     let _ = sender.send(Ok(Report {
                         build: build.clone(),
-                        freezing: false,
+                        active: ActiveStats::default(),
                     }));
                     let candidates = memory.scan(&character, &worker_cancel)?;
-                    let actor = memory.verify_actor(
+                    let (actor, active) = memory.verify_actor(
                         &candidates,
                         &character,
                         &worker_observation,
-                        named_override,
                         &worker_cancel,
                     )?;
                     let writer = Memory::open(instance, true)?;
-                    writer.freeze(actor, &character, &worker_cancel, || {
-                        let _ = sender.send(Ok(Report {
-                            build,
-                            freezing: true,
-                        }));
-                    })?;
+                    writer.freeze(
+                        actor,
+                        active,
+                        &character,
+                        &worker_observation,
+                        &worker_cancel,
+                        |active| {
+                            let _ = sender.send(Ok(Report {
+                                build: build.clone(),
+                                active,
+                            }));
+                        },
+                    )?;
                     Ok::<(), io::Error>(())
                 };
                 if let Err(error) = work() {
@@ -145,7 +184,7 @@ struct Actor {
     header: usize,
     level: u32,
     health: f32,
-    damage: f32,
+    stats: [f32; 4],
 }
 
 impl Memory {
@@ -195,7 +234,7 @@ impl Memory {
         if !name[..length].eq_ignore_ascii_case(character.as_bytes()) {
             return Err(io::Error::other("Character name changed."));
         }
-        let mut bytes = [0; LEVEL_DISTANCE + STAT_BYTES];
+        let mut bytes = [0; LEVEL_DISTANCE + TARGET_FIELD_BYTES];
         self.read(base - LEVEL_DISTANCE, &mut bytes)?;
         let level = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let hp = f32::from_le_bytes(
@@ -203,11 +242,10 @@ impl Memory {
                 .try_into()
                 .unwrap(),
         );
-        let damage = f32::from_le_bytes(
-            bytes[LEVEL_DISTANCE + 4..LEVEL_DISTANCE + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let stats = TARGETS.map(|target| {
+            let index = LEVEL_DISTANCE + target.offset;
+            f32::from_le_bytes(bytes[index..index + 4].try_into().unwrap())
+        });
         if !(1..=10_000).contains(&level) || !(50.0..=1e6).contains(&hp) {
             return Err(io::Error::other("Character level or health is invalid."));
         }
@@ -216,7 +254,7 @@ impl Memory {
             header,
             level,
             health: hp,
-            damage,
+            stats,
         })
     }
 
@@ -225,44 +263,27 @@ impl Memory {
         candidates: &[(usize, usize)],
         character: &str,
         observation: &Mutex<Option<hud::Player>>,
-        named_override: bool,
         cancel: &AtomicBool,
-    ) -> io::Result<Actor> {
-        let initial: Vec<_> = candidates
-            .iter()
-            .filter_map(|&(base, header)| self.actor(base, header, character).ok())
-            .collect();
-        if initial.is_empty() {
+    ) -> io::Result<(Actor, ActiveStats)> {
+        if candidates.is_empty() {
             return Err(io::Error::other(
                 "The named solo character is not in memory yet.",
             ));
         }
         let deadline = Instant::now() + Duration::from_secs(50);
-        let mut last = None;
         while Instant::now() < deadline {
             check_cancel(cancel)?;
-            let current = initial
+            let current = candidates
                 .iter()
-                .filter_map(|actor| self.actor(actor.base, actor.header, character).ok())
-                .collect::<Vec<_>>();
-            if let Some(actor) = observation
-                .lock()
-                .unwrap()
+                .filter_map(|&(base, header)| self.actor(base, header, character).ok());
+            let player = observation.lock().unwrap().clone();
+            if let Some(selected) = player
                 .as_ref()
                 .filter(|player| player.name.eq_ignore_ascii_case(character))
-                .and_then(|player| unique_panel_match(&current, player))
+                .and_then(|player| unique_panel_match(current, player))
             {
-                return Ok(actor);
+                return Ok(selected);
             }
-            let advancing = named_override
-                .then(|| unique_progress(&initial, current.into_iter()))
-                .flatten();
-            if let Some(actor) = advancing {
-                if last == Some(actor.base) {
-                    return Ok(actor);
-                }
-            }
-            last = advancing.map(|actor| actor.base);
             thread::sleep(POLL_INTERVAL);
         }
         Err(io::Error::other(
@@ -273,11 +294,13 @@ impl Memory {
     fn freeze(
         &self,
         mut actor: Actor,
+        mut active: ActiveStats,
         character: &str,
+        observation: &Mutex<Option<hud::Player>>,
         cancel: &AtomicBool,
-        started: impl FnOnce(),
+        mut on_active: impl FnMut(ActiveStats),
     ) -> io::Result<()> {
-        let mut started = Some(started);
+        let mut reported = ActiveStats::default();
         let mut next_tick = Instant::now();
         loop {
             check_cancel(cancel)?;
@@ -288,12 +311,25 @@ impl Memory {
                 ));
             }
             actor = fresh;
-            for target in &TARGETS {
+            if !active.iter().all(|&enabled| enabled)
+                && let Some(player) = observation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|player| player.name.eq_ignore_ascii_case(character))
+            {
+                active = extend_active(active, matched_stats(actor, player));
+            }
+            for (target, enabled) in TARGETS.iter().zip(active) {
+                if !enabled {
+                    continue;
+                }
                 check_cancel(cancel)?;
                 self.write_stat(actor.base + target.offset, target.value)?;
             }
-            if let Some(started) = started.take() {
-                started();
+            if reported != active {
+                on_active(active);
+                reported = active;
             }
             next_tick += POLL_INTERVAL;
             let now = Instant::now();
@@ -393,19 +429,38 @@ impl Memory {
     }
 }
 
-fn unique_panel_match(actors: &[Actor], player: &hud::Player) -> Option<Actor> {
-    if player.captured.elapsed() > Duration::from_secs(5) {
-        return None;
+fn matched_stats(actor: Actor, player: &hud::Player) -> ActiveStats {
+    if player.captured.elapsed() > Duration::from_secs(5)
+        || (player.level.is_none() && player.health.is_none())
+        || player.level.is_some_and(|level| level != actor.level)
+        || player
+            .health
+            .is_some_and(|health| (health - actor.health).abs() > 1.1)
+    {
+        return ActiveStats::default();
     }
-    let mut matches = actors.iter().copied().filter(|actor| {
-        player
-            .level
-            .map_or(actor.level > 1, |level| actor.level == level)
-            && (actor.health - player.health).abs() <= 1.1
-            && (actor.damage - player.damage).abs() <= 0.0051
+    std::array::from_fn(|index| {
+        player.stats[index].is_some_and(|value| (value - actor.stats[index]).abs() <= 0.0051)
+    })
+}
+
+fn unique_panel_match(
+    actors: impl Iterator<Item = Actor>,
+    player: &hud::Player,
+) -> Option<(Actor, ActiveStats)> {
+    let mut matches = actors.filter_map(|actor| {
+        let active = matched_stats(actor, player);
+        active
+            .iter()
+            .any(|&enabled| enabled)
+            .then_some((actor, active))
     });
-    let actor = matches.next()?;
-    matches.next().is_none().then_some(actor)
+    let selection = matches.next()?;
+    matches.next().is_none().then_some(selection)
+}
+
+fn extend_active(active: ActiveStats, matched: ActiveStats) -> ActiveStats {
+    std::array::from_fn(|index| active[index] || matched[index])
 }
 
 impl Drop for Memory {
@@ -420,16 +475,6 @@ fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
     } else {
         Ok(())
     }
-}
-
-fn unique_progress(initial: &[Actor], current: impl Iterator<Item = Actor>) -> Option<Actor> {
-    let mut advancing = current.filter(|actor| {
-        initial
-            .iter()
-            .any(|old| old.base == actor.base && old.level < actor.level)
-    });
-    let actor = advancing.next()?;
-    advancing.next().is_none().then_some(actor)
 }
 
 fn candidate_offsets(bytes: &[u8], start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
@@ -568,41 +613,12 @@ mod tests {
     }
 
     #[test]
-    fn level_progress_distinguishes_the_live_record_from_a_stale_copy() {
-        let stale = Actor {
-            base: 1000,
-            header: 200,
-            level: 1,
-            health: 200.0,
-            damage: 1.9,
-        };
-        let live = Actor {
-            base: 2000,
-            header: 1200,
-            level: 20,
-            health: 839.3,
-            damage: 3.34,
-        };
-        let initial = [stale, live];
-        assert!(unique_progress(&initial, initial.into_iter()).is_none());
-
-        let next = Actor { level: 21, ..live };
-        assert_eq!(
-            unique_progress(&initial, [stale, next].into_iter()).map(|actor| actor.base),
-            Some(live.base)
-        );
-
-        let duplicate = Actor { level: 2, ..stale };
-        assert!(unique_progress(&initial, [duplicate, next].into_iter()).is_none());
-    }
-
-    #[test]
-    fn starts_freezing_when_one_record_matches_the_current_panel() {
-        let player = hud::Player {
+    fn starts_with_one_matching_stat_and_retains_it_when_more_appear() {
+        let mut player = hud::Player {
             name: "Hero".into(),
             level: Some(20),
-            health: 839.0,
-            damage: 3.34,
+            health: None,
+            stats: [None, Some(1.36), None, None],
             captured: Instant::now(),
         };
         let live = Actor {
@@ -610,22 +626,49 @@ mod tests {
             header: 1200,
             level: 20,
             health: 839.3,
-            damage: 3.338,
+            stats: [3.338, 1.36, 0.0, 1.31],
         };
         let stale = Actor {
             base: 3000,
             level: 1,
             ..live
         };
+        let (actor, active) = unique_panel_match([stale, live].into_iter(), &player).unwrap();
+        assert_eq!(actor.base, live.base);
+        assert_eq!(active, [false, true, false, false]);
+
+        player.stats = [None, None, None, Some(1.31)];
+        let active = extend_active(active, matched_stats(live, &player));
+        assert_eq!(active, [false, true, false, true]);
+        player.stats = [Some(3.34), None, Some(0.0), None];
         assert_eq!(
-            unique_panel_match(&[stale, live], &player).map(|actor| actor.base),
-            Some(live.base)
+            extend_active(active, matched_stats(live, &player)),
+            [true; 4]
         );
-        assert!(unique_panel_match(&[Actor { base: 4000, ..live }, live], &player).is_none());
+    }
+
+    #[test]
+    fn ambiguous_or_stale_panel_readings_do_not_activate_a_stat() {
+        let player = hud::Player {
+            name: "Hero".into(),
+            level: None,
+            health: Some(839.0),
+            stats: [None, None, Some(0.0), None],
+            captured: Instant::now(),
+        };
+        let live = Actor {
+            base: 2000,
+            header: 1200,
+            level: 20,
+            health: 839.3,
+            stats: [3.338, 1.36, 0.0, 1.31],
+        };
+        let duplicate = Actor { base: 4000, ..live };
+        assert!(unique_panel_match([duplicate, live].into_iter(), &player).is_none());
         let old = hud::Player {
             captured: Instant::now() - Duration::from_secs(6),
             ..player
         };
-        assert!(unique_panel_match(&[live], &old).is_none());
+        assert!(unique_panel_match([live].into_iter(), &old).is_none());
     }
 }

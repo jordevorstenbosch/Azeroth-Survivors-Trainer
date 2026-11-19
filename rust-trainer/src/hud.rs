@@ -1,3 +1,4 @@
+use crate::discovery::TARGETS;
 use image::{RgbaImage, imageops::FilterType};
 use std::{io, ptr::null_mut, slice, time::Instant};
 use windows::{
@@ -29,8 +30,8 @@ pub struct Reading {
 pub struct Player {
     pub name: String,
     pub level: Option<u32>,
-    pub health: f32,
-    pub damage: f32,
+    pub health: Option<f32>,
+    pub stats: [Option<f32>; 4],
     pub captured: Instant,
 }
 
@@ -96,15 +97,14 @@ fn read_stat_panels(engine: &OcrEngine, image: &RgbaImage) -> windows::core::Res
         text.push_str(&stat_rows(&result)?);
     }
     let stats = stats_from_text(&text);
-    if !stats.is_empty() {
+    if TARGETS
+        .iter()
+        .any(|target| target.panel_value(&stats).is_some())
+    {
         return Ok(stats);
     }
     let result = recognize(engine, image.as_raw(), width as usize, height as usize)?;
-    let mut stats = stats_from_text(&stat_rows(&result)?);
-    if stats.len() < 2 {
-        stats.clear();
-    }
-    Ok(stats)
+    Ok(stats_from_text(&stat_rows(&result)?))
 }
 
 fn read_player(
@@ -115,16 +115,17 @@ fn read_player(
 ) -> Option<Player> {
     let health = stats
         .iter()
-        .find_map(|stat| stat.strip_prefix("HP "))?
-        .replace(',', "")
-        .parse::<f32>()
-        .ok()?;
-    let damage = stats
-        .iter()
-        .find_map(|stat| stat.strip_prefix("Damage "))?
-        .strip_suffix('%')?
-        .parse::<f32>()
-        .ok()?;
+        .find_map(|stat| {
+            stat.strip_prefix("HP ")?
+                .replace(',', "")
+                .parse::<f32>()
+                .ok()
+        })
+        .filter(|value| (50.0..=1e6).contains(value));
+    let verified_stats = TARGETS.map(|target| target.panel_value(stats));
+    if verified_stats.iter().all(Option::is_none) {
+        return None;
+    }
     let read = |bounds| read_crop(engine, image, bounds);
     let header = read([0.047, 0.131, 0.218, 0.197]);
     let parsed = header.as_deref().and_then(character_header);
@@ -144,7 +145,7 @@ fn read_player(
         name: name.to_owned(),
         level,
         health,
-        damage: 1.0 + damage / 100.0,
+        stats: verified_stats,
         captured,
     })
 }
@@ -277,22 +278,7 @@ fn stat_rows(result: &OcrResult) -> windows::core::Result<String> {
 }
 
 fn stats_from_text(text: &str) -> Vec<String> {
-    let labels = [
-        "Health",
-        "Damage",
-        "Haste",
-        "Crit Dmg",
-        "Crit",
-        "Armor",
-        "Area",
-        "Echo",
-        "Speed",
-        "Lifesteal",
-        "Gold",
-        "Experience",
-        "Luck",
-        "Shielded",
-    ];
+    let labels = ["Health", "Damage", "Area", "Gold", "Luck"];
     let mut values = Vec::new();
     for label in labels {
         let mut matches = text.lines().filter_map(|line| stat_on_row(line, label));

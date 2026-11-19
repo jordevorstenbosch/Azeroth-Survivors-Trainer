@@ -20,7 +20,7 @@ Use the trainer in solo runs or games you host. Version 3.0.0 gameplay testing c
 | Luck | +9999% |
 | Gold Bonus | +9999% |
 
-The watcher matches the character panel to the live player record, applies all four targets immediately, and rewrites them every 0.5 seconds. It keeps using the same record through level-ups. The game's recalculation can briefly reset a value before the next rewrite.
+The watcher matches the character panel to the live player record. It starts rewriting the first verified stat every 0.5 seconds and adds the others as they are verified. It keeps using the same record through level-ups. The game's recalculation can briefly reset a value before the next rewrite.
 
 ## Updates and troubleshooting
 

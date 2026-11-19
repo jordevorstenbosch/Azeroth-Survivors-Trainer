@@ -23,20 +23,20 @@ use windows_sys::Win32::{
         Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
         Gdi::{
             CreateFontW, CreateSolidBrush, DC_BRUSH, DEFAULT_GUI_FONT as UI_FONT, DT_CENTER,
-            DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW,
-            FillRect, GetStockObject, HFONT, SelectObject, SetBkMode, SetDCBrushColor,
-            SetTextColor, TRANSPARENT,
+            DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject,
+            DrawFocusRect, DrawTextW, FillRect, GetStockObject, HFONT, SelectObject, SetBkMode,
+            SetDCBrushColor, SetTextColor, TRANSPARENT,
         },
     },
     System::{
         LibraryLoader::GetModuleHandleW,
-        SystemServices::{SS_NOPREFIX, SS_RIGHT},
+        SystemServices::{SS_NOPREFIX, SS_OWNERDRAW, SS_RIGHT},
     },
     UI::{
         Controls::{
             DRAWITEMSTRUCT,
             Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW},
-            ODS_DISABLED, ODS_FOCUS, ODS_SELECTED,
+            ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, ODT_STATIC,
         },
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem},
         Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled, SetFocus},
@@ -59,6 +59,7 @@ const DIVIDER: u16 = 110;
 const LOCATE: u16 = 111;
 const STOP: u16 = 112;
 const MUTED_TEXT: u16 = 113;
+const STAT_CARD: u16 = 115;
 const PROCESS_LOOKUP_LIMIT: u8 = 10;
 const BACKGROUND: u32 = rgb(22, 23, 30);
 const TEXT: u32 = rgb(242, 241, 247);
@@ -110,6 +111,7 @@ struct Window {
     build: Option<String>,
     discovery: Option<discovery::Job>,
     discovery_phase: DiscoveryPhase,
+    active_stats: discovery::ActiveStats,
     discovery_message: String,
     next_discovery: Instant,
     reading: hud::Reading,
@@ -264,9 +266,14 @@ impl Window {
             .then(|| unsafe { GetDlgCtrlID(previous_focus) });
         self.render_cursor = 0;
 
-        let freezing = self.watching && self.discovery_phase == DiscoveryPhase::Freezing;
-        let show_update = !self.update_message.is_empty();
-        let height = if show_update { 266 } else { 228 };
+        let active_count = self.active_stats.iter().filter(|&&active| active).count() as i32;
+        let rows = (active_count + 1) / 2;
+        let height = if rows == 0 { 228 } else { 254 + rows * 62 }
+            + if self.update_message.is_empty() {
+                0
+            } else {
+                38
+            };
         let mut outer = RECT {
             left: 0,
             top: 0,
@@ -289,7 +296,7 @@ impl Window {
             self.rendered_height = height;
         }
 
-        self.render_overview(hwnd, freezing);
+        self.render_overview(hwnd, rows);
         self.render_footer(hwnd, height);
         for control in self.children.drain(self.render_cursor..) {
             if !control.hwnd.is_null() {
@@ -320,7 +327,8 @@ impl Window {
         set_font(control, self.heading_font.handle());
     }
 
-    fn render_overview(&mut self, hwnd: HWND, freezing: bool) {
+    fn render_overview(&mut self, hwnd: HWND, rows: i32) {
+        let freezing = rows != 0;
         let configured = self.settings.game_path().is_some_and(game::valid_path);
         let (label, action) = if !configured {
             ("Locate game", LOCATE)
@@ -386,8 +394,12 @@ impl Window {
         let detail = if configured
             && self.watching
             && self.running
-            && self.discovery_phase == DiscoveryPhase::WaitingForPanel
-        {
+            && matches!(
+                self.discovery_phase,
+                DiscoveryPhase::Searching
+                    | DiscoveryPhase::WaitingForPanel
+                    | DiscoveryPhase::Retrying
+            ) {
             CHARACTER_PANEL_PROMPT.to_owned()
         } else if !self.message.is_empty() {
             self.message.clone()
@@ -408,6 +420,12 @@ impl Window {
         };
         self.text(hwnd, &detail, [42, 108, 440, 36], MUTED_TEXT);
 
+        let metadata_y = if freezing {
+            self.render_stats(hwnd);
+            184 + rows * 62
+        } else {
+            151
+        };
         let build = self
             .build
             .as_deref()
@@ -416,7 +434,7 @@ impl Window {
         self.text(
             hwnd,
             &format!("Game build  {build}"),
-            [18, 151, 264, 20],
+            [18, metadata_y, 264, 20],
             MUTED_TEXT,
         );
         if self.watching {
@@ -425,9 +443,31 @@ impl Window {
                 "STATIC",
                 "Solo / host mode",
                 SS_RIGHT | SS_NOPREFIX,
-                [331, 151, 151, 20],
+                [331, metadata_y, 151, 20],
                 MUTED_TEXT,
             );
+        }
+    }
+
+    fn render_stats(&mut self, hwnd: HWND) {
+        self.text(hwnd, "Stats", [18, 146, 220, 20], 0);
+        let targets = discovery::TARGETS
+            .iter()
+            .zip(self.active_stats)
+            .filter_map(|(target, active)| active.then_some(target));
+        for (index, target) in targets.enumerate() {
+            let caption = format!("{}\n{}", target.name, target.displayed_bonus());
+            let x = 18 + (index % 2) as i32 * 237;
+            let y = 173 + (index / 2) as i32 * 62;
+            let tile = self.child(
+                hwnd,
+                "STATIC",
+                &caption,
+                SS_OWNERDRAW,
+                [x, y, 227, 53],
+                STAT_CARD,
+            );
+            set_font(tile, self.heading_font.handle());
         }
     }
 
@@ -568,10 +608,16 @@ impl Window {
                         self.log(&format!("Game build SHA-256: {}", report.build));
                         self.build = Some(report.build);
                     }
-                    if report.freezing {
+                    self.active_stats = report.active;
+                    let names: Vec<_> = discovery::TARGETS
+                        .iter()
+                        .zip(report.active)
+                        .filter_map(|(target, active)| active.then_some(target.name))
+                        .collect();
+                    if !names.is_empty() {
                         (
                             DiscoveryPhase::Freezing,
-                            "Freezing Damage, Area, Luck, and Gold Bonus every 0.5 seconds.".into(),
+                            format!("Freezing {} every 0.5 seconds.", names.join(", ")),
                         )
                     } else {
                         (
@@ -582,15 +628,18 @@ impl Window {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
                     self.discovery = None;
+                    self.active_stats.fill(false);
                     (DiscoveryPhase::Unsupported, error.to_string())
                 }
-                Err(error) => (
-                    DiscoveryPhase::Retrying,
-                    format!("Memory discovery will retry. {error}"),
-                ),
+                Err(error) => {
+                    self.active_stats.fill(false);
+                    (
+                        DiscoveryPhase::Retrying,
+                        format!("Memory discovery will retry. {error}"),
+                    )
+                }
             })
         } else if Instant::now() >= self.next_discovery {
-            let named_override = self.solo_character.is_some();
             let name = self.solo_character.clone().or_else(|| {
                 self.reading
                     .player
@@ -608,7 +657,6 @@ impl Window {
                 instance,
                 name,
                 self.reading.player.clone(),
-                named_override,
             ) {
                 Ok(job) => {
                     self.discovery = Some(job);
@@ -675,7 +723,8 @@ impl Window {
             }
         }
         if self.watching
-            && self.discovery_phase != DiscoveryPhase::Freezing
+            && self.discovery_phase != DiscoveryPhase::Unsupported
+            && self.active_stats.contains(&false)
             && self.capture.is_none()
             && Instant::now() >= self.next_capture
         {
@@ -694,6 +743,7 @@ impl Window {
         self.scan_generation = self.scan_generation.wrapping_add(1);
         self.discovery = None;
         self.discovery_phase = DiscoveryPhase::Searching;
+        self.active_stats.fill(false);
         self.discovery_message.clear();
         self.next_discovery = Instant::now();
         self.reading = hud::Reading::default();
@@ -884,6 +934,58 @@ fn set_font(hwnd: HWND, font: HFONT) {
     }
 }
 
+fn draw_stat_card(item: &DRAWITEMSTRUCT) {
+    unsafe {
+        let brush = CreateSolidBrush(SECONDARY);
+        FillRect(item.hDC, &item.rcItem, brush);
+        DeleteObject(brush);
+
+        let mut caption = [0u16; 96];
+        let count = GetWindowTextW(item.hwndItem, caption.as_mut_ptr(), caption.len() as i32);
+        let caption = &caption[..count.max(0) as usize];
+        let Some(divider) = caption.iter().position(|&ch| ch == u16::from(b'\n')) else {
+            return;
+        };
+        let (label, value) = caption.split_at(divider);
+        let value = &value[1..];
+
+        let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+        let old_font = if font.is_null() {
+            null_mut()
+        } else {
+            SelectObject(item.hDC, font.cast())
+        };
+        let scale = |pixels| pixels * (item.rcItem.bottom - item.rcItem.top) / 53;
+        let mut name_rect = item.rcItem;
+        let mut value_rect = item.rcItem;
+        name_rect.left += scale(13);
+        name_rect.right -= scale(88);
+        value_rect.left = name_rect.right;
+        value_rect.right -= scale(13);
+        let flags = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+        SetBkMode(item.hDC, TRANSPARENT as i32);
+        SetTextColor(item.hDC, TEXT);
+        DrawTextW(
+            item.hDC,
+            label.as_ptr(),
+            label.len() as i32,
+            &mut name_rect,
+            flags | DT_END_ELLIPSIS,
+        );
+        SetTextColor(item.hDC, LIVE);
+        DrawTextW(
+            item.hDC,
+            value.as_ptr(),
+            value.len() as i32,
+            &mut value_rect,
+            flags | DT_RIGHT,
+        );
+        if !old_font.is_null() {
+            SelectObject(item.hDC, old_font);
+        }
+    }
+}
+
 fn pick_game(hwnd: HWND) -> Option<PathBuf> {
     let mut path = vec![0u16; 32768];
     let filters = wide("Azeroth Survivors\0AzerothSurvivors.exe\0\0");
@@ -933,7 +1035,12 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
                 return 0;
             }
             WM_DRAWITEM if l != 0 => {
-                draw_button(&*(l as *const DRAWITEMSTRUCT));
+                let item = &*(l as *const DRAWITEMSTRUCT);
+                if item.CtlType == ODT_STATIC && item.CtlID == u32::from(STAT_CARD) {
+                    draw_stat_card(item);
+                } else {
+                    draw_button(item);
+                }
                 return 1;
             }
             WM_CTLCOLORSTATIC => {
@@ -1017,6 +1124,7 @@ fn run() -> std::io::Result<()> {
             build: None,
             discovery: None,
             discovery_phase: DiscoveryPhase::Searching,
+            active_stats: discovery::ActiveStats::default(),
             discovery_message: String::new(),
             next_discovery: Instant::now(),
             reading: hud::Reading::default(),
