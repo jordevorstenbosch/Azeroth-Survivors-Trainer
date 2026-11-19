@@ -217,19 +217,16 @@ impl Memory {
         started: impl FnOnce(),
     ) -> io::Result<()> {
         let mut started = Some(started);
-        let mut progress = Instant::now();
+        let mut next_tick = Instant::now();
         loop {
             check_cancel(cancel)?;
             let fresh = self.actor(actor.base, actor.header, character)?;
-            if fresh.level < actor.level || progress.elapsed() >= Duration::from_secs(120) {
+            if fresh.level < actor.level {
                 return Err(io::Error::other(
-                    "Solo run progress ended. Reacquiring the character.",
+                    "The solo run changed. Reacquiring the character.",
                 ));
             }
-            if fresh.level != actor.level {
-                progress = Instant::now();
-                actor = fresh;
-            }
+            actor = fresh;
             for (offset, value) in TARGETS {
                 check_cancel(cancel)?;
                 self.write_stat(actor.base + offset, value)?;
@@ -237,7 +234,12 @@ impl Memory {
             if let Some(started) = started.take() {
                 started();
             }
-            thread::sleep(POLL_INTERVAL);
+            next_tick += POLL_INTERVAL;
+            let now = Instant::now();
+            if next_tick <= now {
+                next_tick = now + POLL_INTERVAL;
+            }
+            thread::sleep(next_tick.duration_since(now));
         }
     }
 
