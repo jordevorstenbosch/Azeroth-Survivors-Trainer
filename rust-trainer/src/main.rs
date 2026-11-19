@@ -738,8 +738,17 @@ impl Window {
                 let release = release.clone();
                 let download = release.clone();
                 let mut args: Vec<_> = env::args_os().skip(1).collect();
-                if self.watching && !args.iter().any(|arg| arg == "--autostart") {
-                    args.push("--autostart".into());
+                if self.watching {
+                    if !args.iter().any(|arg| arg == "--autostart") {
+                        args.push("--autostart".into());
+                    }
+                } else {
+                    args.retain(|arg| {
+                        arg != "--autostart"
+                            && !arg
+                                .to_str()
+                                .is_some_and(|arg| arg.starts_with("--solo-character="))
+                    });
                 }
                 let (sender, receiver) = mpsc::sync_channel(1);
                 std::thread::spawn(move || {
