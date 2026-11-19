@@ -20,7 +20,8 @@ use windows_sys::Win32::{
     },
     Storage::Xps::PrintWindow,
     UI::WindowsAndMessaging::{
-        EnumWindows, GetClientRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        EnumWindows, GetClientRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible,
     },
 };
 
@@ -135,9 +136,9 @@ fn read_ocr(pid: u32) -> Result<Reading, String> {
 }
 
 fn read_name(engine: &OcrEngine, frame: &Frame) -> Option<String> {
-    // Isolate the left player nameplate from the adjacent target nameplate.
-    let left = frame.width * 56 / 1000;
-    let right = frame.width * 130 / 1000;
+    // The frame is half the client width, so double the full-window proportions.
+    let left = frame.width * 112 / 1000;
+    let right = frame.width * 260 / 1000;
     let top = frame.height * 33 / 1000;
     let bottom = frame.height * 52 / 1000;
     let width = (right - left) * 4;
@@ -240,8 +241,13 @@ fn game_window(pid: u32) -> HWND {
             let mut owner = 0;
             GetWindowThreadProcessId(hwnd, &mut owner);
             if owner == search.pid && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
-                search.hwnd = hwnd;
-                return 0;
+                let mut title = [0u16; 64];
+                let len = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) as usize;
+                if String::from_utf16_lossy(&title[..len]).eq_ignore_ascii_case("Azeroth Survivors")
+                {
+                    search.hwnd = hwnd;
+                    return 0;
+                }
             }
             1
         }
@@ -292,11 +298,18 @@ fn capture(pid: u32) -> io::Result<Frame> {
         }
         let previous = SelectObject(dc, bitmap);
         let frame = if !previous.is_null() && PrintWindow(hwnd, dc, 3) != 0 {
+            let stride = width as usize * 4;
+            let crop_width = width as usize / 2;
+            let height = height as usize;
+            let source = slice::from_raw_parts(bits.cast::<u8>(), stride * height);
+            let mut pixels = Vec::with_capacity(crop_width * height * 4);
+            for row in source.chunks_exact(stride) {
+                pixels.extend_from_slice(&row[..crop_width * 4]);
+            }
             Ok(Frame {
-                pixels: slice::from_raw_parts(bits.cast::<u8>(), (width * height * 4) as usize)
-                    .to_vec(),
-                width: width as usize,
-                height: height as usize,
+                pixels,
+                width: crop_width,
+                height,
             })
         } else {
             Err(io::Error::other("The game did not return a screenshot."))
