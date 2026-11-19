@@ -4,14 +4,7 @@ use windows::{
     Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
     Media::Ocr::{OcrEngine, OcrResult},
     Storage::Streams::DataWriter,
-    Win32::{
-        Foundation::HWND as AutomationHwnd,
-        System::{
-            Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
-            WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
-        },
-        UI::Accessibility::{CUIAutomation, IUIAutomation},
-    },
+    Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, RECT},
@@ -31,41 +24,13 @@ pub struct Reading {
     pub stats: Vec<String>,
 }
 
-pub const OCR_MISS_LIMIT: u8 = 10;
-
 // Coordinates are fractions of the full client area, as in the legacy reader.
 const STAT_PANELS: [[f32; 4]; 2] = [[0.03, 0.44, 0.25, 0.60], [0.22, 0.12, 0.37, 0.36]];
-
-pub struct Scan {
-    pub primary_misses: u8,
-    pub reading: Result<Reading, String>,
-}
 
 struct Frame {
     pixels: Vec<u8>,
     width: usize,
     height: usize,
-}
-
-pub fn scan(pid: u32, previous_misses: u8) -> Scan {
-    if let Ok(reading) = read_accessibility(pid) {
-        if !reading.stats.is_empty() {
-            return Scan {
-                primary_misses: 0,
-                reading: Ok(reading),
-            };
-        }
-    }
-    let primary_misses = previous_misses.saturating_add(1).min(OCR_MISS_LIMIT);
-    let reading = if primary_misses == OCR_MISS_LIMIT {
-        read_ocr(pid)
-    } else {
-        Ok(Reading::default())
-    };
-    Scan {
-        primary_misses,
-        reading,
-    }
 }
 
 struct Apartment;
@@ -83,49 +48,7 @@ impl Drop for Apartment {
     }
 }
 
-fn read_accessibility(pid: u32) -> windows::core::Result<Reading> {
-    let _apartment = Apartment::enter()?;
-    let hwnd = game_window(pid);
-    // Limit traversal to visible controls within the game window.
-    unsafe {
-        let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-        let root = automation.ElementFromHandle(AutomationHwnd(hwnd))?;
-        let walker = automation.ControlViewWalker()?;
-        let mut pending = vec![(root, true)];
-        let mut text = String::new();
-        for _ in 0..128 {
-            let Some((element, is_root)) = pending.pop() else {
-                break;
-            };
-            if element
-                .CurrentIsOffscreen()
-                .is_ok_and(|value| !value.as_bool())
-            {
-                if let Ok(name) = element.CurrentName() {
-                    text.push_str(&name.to_string());
-                    text.push('\n');
-                }
-            }
-            // The root's siblings belong to other windows.
-            if !is_root {
-                if let Ok(sibling) = walker.GetNextSiblingElement(&element) {
-                    pending.push((sibling, false));
-                }
-            }
-            if let Ok(child) = walker.GetFirstChildElement(&element) {
-                pending.push((child, false));
-            }
-        }
-        let mut stats = stats_from_text(&text);
-        if stats.len() < 2 {
-            stats.clear();
-        }
-        Ok(Reading { stats })
-    }
-}
-
-fn read_ocr(pid: u32) -> Result<Reading, String> {
+pub fn read_ocr(pid: u32) -> Result<Reading, String> {
     let frame = capture(pid).map_err(|error| error.to_string())?;
     let _apartment = Apartment::enter().map_err(|error| error.to_string())?;
     let engine =

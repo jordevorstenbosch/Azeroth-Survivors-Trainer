@@ -83,9 +83,8 @@ struct Window {
     process_lookup_misses: u8,
     build: Option<String>,
     reading: hud::Reading,
-    capture: Option<(u64, Receiver<hud::Scan>)>,
+    capture: Option<(u64, Receiver<Result<hud::Reading, String>>)>,
     scan_generation: u64,
-    primary_misses: u8,
     next_capture: Instant,
     capture_error: Option<String>,
     message: String,
@@ -229,13 +228,7 @@ impl Window {
             "Locate AzerothSurvivors.exe to begin.".into()
         } else if self.watching && self.running {
             if self.reading.stats.is_empty() {
-                if self.primary_misses < hud::OCR_MISS_LIMIT {
-                    format!(
-                        "Checking available stats ({} of {} attempts).",
-                        self.primary_misses,
-                        hud::OCR_MISS_LIMIT
-                    )
-                } else if self.capture_error.is_some() {
+                if self.capture_error.is_some() {
                     "Game detected. Could not read the game window.".into()
                 } else {
                     "Open your character sheet to see detected values.".into()
@@ -249,7 +242,7 @@ impl Window {
         } else if self.watching {
             "Launch the game or wait for it to open.".into()
         } else {
-            "Press Start to check for the game and identify its build.".into()
+            "Press Start to read your character sheet with OCR.".into()
         };
         let toggle = if !configured {
             "Locate game"
@@ -458,6 +451,7 @@ impl Window {
             }
         };
         let mut refresh = self.set_game_instance(instance);
+        refresh |= self.poll_hud();
         if self.watching && self.running && self.build.is_none() {
             match game::build_id(&path) {
                 Ok(build) => {
@@ -477,7 +471,7 @@ impl Window {
                 }
             }
         }
-        self.poll_hud() || refresh
+        refresh
     }
 
     fn poll_hud(&mut self) -> bool {
@@ -485,24 +479,14 @@ impl Window {
         if let Some((generation, receiver)) = &self.capture {
             let generation = *generation;
             let result = match receiver.try_recv() {
-                Ok(scan) => Some(scan),
-                Err(TryRecvError::Disconnected) => Some(hud::Scan {
-                    primary_misses: self.primary_misses,
-                    reading: Err("Detection worker ended.".into()),
-                }),
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err("OCR worker ended.".into())),
                 Err(TryRecvError::Empty) => None,
             };
-            if let Some(scan) = result {
+            if let Some(result) = result {
                 self.capture = None;
                 if self.watching && self.scan_generation == generation {
-                    let previous = self.primary_misses;
-                    self.primary_misses = scan.primary_misses;
-                    refreshed = previous != self.primary_misses;
-                    if previous < hud::OCR_MISS_LIMIT && self.primary_misses == hud::OCR_MISS_LIMIT
-                    {
-                        self.log("Primary stat detection missed 10 times. Using OCR fallback.");
-                    }
-                    match scan.reading {
+                    match result {
                         Ok(reading) => {
                             refreshed |= self.capture_error.take().is_some()
                                 || self.reading.stats != reading.stats;
@@ -524,10 +508,9 @@ impl Window {
         }
         if self.watching && self.capture.is_none() && Instant::now() >= self.next_capture {
             if let Some(process) = self.game_instance {
-                let misses = self.primary_misses;
                 let (sender, receiver) = mpsc::sync_channel(1);
                 std::thread::spawn(move || {
-                    let _ = sender.send(hud::scan(process.pid, misses));
+                    let _ = sender.send(hud::read_ocr(process.pid));
                 });
                 self.capture = Some((self.scan_generation, receiver));
                 self.next_capture = Instant::now() + Duration::from_secs(4);
@@ -538,7 +521,6 @@ impl Window {
 
     fn reset_scan(&mut self) {
         self.scan_generation = self.scan_generation.wrapping_add(1);
-        self.primary_misses = 0;
         self.reading = hud::Reading::default();
         self.capture_error = None;
         self.next_capture = Instant::now();
@@ -802,7 +784,6 @@ fn run() -> std::io::Result<()> {
             reading: hud::Reading::default(),
             capture: None,
             scan_generation: 0,
-            primary_misses: 0,
             capture_error: None,
             next_capture: Instant::now(),
             message: String::new(),
