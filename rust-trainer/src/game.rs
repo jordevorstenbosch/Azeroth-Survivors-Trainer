@@ -98,10 +98,12 @@ fn find_process(path: &Path, require_creation_time: bool) -> io::Result<Option<P
                             let pid = entry.th32ProcessID;
                             if require_creation_time {
                                 match creation_time(handle) {
-                                    Ok(created) => present = Some(ProcessInstance {
-                                        pid,
-                                        created: Some(created),
-                                    }),
+                                    Ok(created) => {
+                                        present = Some(ProcessInstance {
+                                            pid,
+                                            created: Some(created),
+                                        })
+                                    }
                                     Err(error) => unreadable = Some(error),
                                 }
                             } else {

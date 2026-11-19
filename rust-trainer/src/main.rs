@@ -228,7 +228,8 @@ impl Window {
         } else {
             "Waiting for the game"
         };
-        let waiting_for_panel = self.watching && self.running && !self.reading.has_character_panel();
+        let waiting_for_panel =
+            self.watching && self.running && !self.reading.has_character_panel();
         let description = if !self.message.is_empty() {
             self.message.clone()
         } else if !self.discovery_message.is_empty() {
@@ -288,7 +289,11 @@ impl Window {
         self.child(hwnd, "STATIC", &description, 0, [43, 98, 390, 36], 0);
 
         if !waiting_for_panel {
-            let build = self.build.as_deref().map_or("—", |build| &build[..12]);
+            let build = self
+                .build
+                .as_deref()
+                .map_or("—", |build| &build[..12])
+                .to_owned();
             let mut visible = self.reading.stats.chunks(2);
             let first = visible
                 .next()
@@ -472,9 +477,9 @@ impl Window {
             let report = match job.result.try_recv() {
                 Ok(report) => report,
                 Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => {
-                    Err(std::io::Error::other("Discovery worker ended unexpectedly."))
-                }
+                Err(TryRecvError::Disconnected) => Err(std::io::Error::other(
+                    "Discovery worker ended unexpectedly.",
+                )),
             };
             self.discovery = None;
             self.next_discovery = Instant::now() + Duration::from_secs(3);
@@ -487,8 +492,12 @@ impl Window {
                     match (report.candidates, report.unreadable_chunks) {
                         (0, 0) => "Searching game memory for a stat record.".into(),
                         (0, _) => "Some memory could not be read. Retrying discovery.".into(),
-                        (1, _) => "Found a possible stat record. Local player is unverified.".into(),
-                        (count, _) => format!("Found {count} possible stat records. Local player is unverified."),
+                        (1, _) => {
+                            "Found a possible stat record. Local player is unverified.".into()
+                        }
+                        (count, _) => format!(
+                            "Found {count} possible stat records. Local player is unverified."
+                        ),
                     }
                 }
                 Err(error) => format!("Memory discovery will retry. {error}"),

@@ -54,10 +54,7 @@ impl Job {
                 })();
                 let _ = sender.send(report);
             })?;
-        Ok(Self {
-            cancel,
-            result,
-        })
+        Ok(Self { cancel, result })
     }
 }
 
@@ -71,9 +68,8 @@ struct Memory(HANDLE);
 
 impl Memory {
     fn open(instance: game::ProcessInstance) -> io::Result<Self> {
-        let handle = unsafe {
-            OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, instance.pid)
-        };
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, instance.pid) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -116,12 +112,18 @@ impl Memory {
             check_cancel(cancel)?;
             let mut region = MEMORY_BASIC_INFORMATION::default();
             let size = unsafe {
-                VirtualQueryEx(self.0, next as _, &mut region, size_of::<MEMORY_BASIC_INFORMATION>())
+                VirtualQueryEx(
+                    self.0,
+                    next as _,
+                    &mut region,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
             };
             if size == 0 {
                 let error = io::Error::last_os_error();
                 // ERROR_INVALID_PARAMETER marks the end of user-mode addresses.
-                return if next != 0 && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return if next != 0 && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
+                {
                     Ok(report)
                 } else {
                     Err(error)
@@ -182,8 +184,14 @@ fn candidate_offsets(bytes: &[u8], start: usize, end: usize) -> impl Iterator<It
     // Use the 2.1.3 stat shape as a discovery hint. The two known level positions
     // cover the name-based and pattern-based layouts.
     let ranges = [
-        50.0..=1e6, 0.5..=2e4, 0.000001..=10.0, 0.01..=200.0,
-        1.2..=200.0, 0.5..=3.0, 10.0..=1e4, 0.99..=1e6,
+        50.0..=1e6,
+        0.5..=2e4,
+        0.000001..=10.0,
+        0.01..=200.0,
+        1.2..=200.0,
+        0.5..=3.0,
+        10.0..=1e4,
+        0.99..=1e6,
     ];
     (start.next_multiple_of(4)..end)
         .step_by(4)
@@ -191,16 +199,18 @@ fn candidate_offsets(bytes: &[u8], start: usize, end: usize) -> impl Iterator<It
             let Some(stats) = bytes.get(offset..offset + STAT_BYTES) else {
                 return false;
             };
-            stats.chunks_exact(4).zip(&ranges).all(|(raw, range)| {
-                range.contains(&f32::from_le_bytes(raw.try_into().unwrap()))
-            }) && [
-                offset.checked_sub(LEVEL_DISTANCE),
-                offset.checked_add(LEVEL_DISTANCE),
-            ]
-            .into_iter()
-            .flatten()
-            .filter_map(|position| bytes.get(position..position + 4))
-            .any(|raw| (1..=10_000).contains(&u32::from_le_bytes(raw.try_into().unwrap())))
+            stats
+                .chunks_exact(4)
+                .zip(&ranges)
+                .all(|(raw, range)| range.contains(&f32::from_le_bytes(raw.try_into().unwrap())))
+                && [
+                    offset.checked_sub(LEVEL_DISTANCE),
+                    offset.checked_add(LEVEL_DISTANCE),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|position| bytes.get(position..position + 4))
+                .any(|raw| (1..=10_000).contains(&u32::from_le_bytes(raw.try_into().unwrap())))
         })
 }
 
@@ -213,9 +223,12 @@ fn name_headers(before: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
             let capacity = u64::from_le_bytes(header[..8].try_into().unwrap());
             let pointer = u64::from_le_bytes(header[8..16].try_into().unwrap());
             let length = u64::from_le_bytes(header[16..].try_into().unwrap());
-            (length >= 2 && length <= 24 && length <= capacity && capacity <= 256
+            (length >= 2
+                && length <= 24
+                && length <= capacity
+                && capacity <= 256
                 && (0x10000..0x7fff_ffff_f000).contains(&pointer))
-                .then_some((pointer as usize, length as usize))
+            .then_some((pointer as usize, length as usize))
         })
 }
 
@@ -236,14 +249,20 @@ mod tests {
         let mut bytes = [0; 512];
         let position = 256;
         let stats = [210.0_f32, 1.83, 1.0, 0.04, 1.5, 1.0, 40.0, 1.0];
-        for (slot, stat) in bytes[position..position + STAT_BYTES].chunks_exact_mut(4).zip(stats) {
+        for (slot, stat) in bytes[position..position + STAT_BYTES]
+            .chunks_exact_mut(4)
+            .zip(stats)
+        {
             slot.copy_from_slice(&stat.to_le_bytes());
         }
         assert_eq!(candidate_offsets(&bytes, 0, bytes.len()).next(), None);
         let level = position + LEVEL_DISTANCE;
         bytes[level..level + 4].copy_from_slice(&3_u32.to_le_bytes());
         assert_eq!(candidate_offsets(&bytes, 0, position).next(), None);
-        assert_eq!(candidate_offsets(&bytes, position, bytes.len()).collect::<Vec<_>>(), [position]);
+        assert_eq!(
+            candidate_offsets(&bytes, position, bytes.len()).collect::<Vec<_>>(),
+            [position]
+        );
     }
 
     #[test]
@@ -270,8 +289,16 @@ mod tests {
         let memory = Memory::open(instance).unwrap();
         let expected = [12_u8, 34, 56, 78];
         let mut actual = [0; 4];
-        memory.read(expected.as_ptr() as usize, &mut actual).unwrap();
+        memory
+            .read(expected.as_ptr() as usize, &mut actual)
+            .unwrap();
         assert_eq!(actual, expected);
-        assert!(Memory::open(game::ProcessInstance { created: None, ..instance }).is_err());
+        assert!(
+            Memory::open(game::ProcessInstance {
+                created: None,
+                ..instance
+            })
+            .is_err()
+        );
     }
 }
