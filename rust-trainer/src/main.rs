@@ -49,11 +49,8 @@ const TITLE: &str = "Azeroth Survivors Trainer";
 const REPO: &str = "https://github.com/nelbin4/Azeroth-Survivors-Trainer";
 const START: u16 = 100;
 const LAUNCH: u16 = 101;
-const TALENTS: u16 = 102;
 const CHECK_UPDATES: u16 = 103;
 const GITHUB: u16 = 104;
-const BACK: u16 = 105;
-const SAVES: u16 = 106;
 const PRIMARY_LAUNCH: u16 = 107;
 const STATUS_DOT: u16 = 108;
 const READY_DOT: u16 = 109;
@@ -61,7 +58,6 @@ const DIVIDER: u16 = 110;
 const LOCATE: u16 = 111;
 const STOP: u16 = 112;
 const MUTED_TEXT: u16 = 113;
-const LIVE_TEXT: u16 = 114;
 const STAT_CARD: u16 = 115;
 const PROCESS_LOOKUP_LIMIT: u8 = 10;
 const BACKGROUND: u32 = rgb(22, 23, 30);
@@ -80,12 +76,6 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Panel {
-    Main,
-    Talents,
-}
-
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum DiscoveryPhase {
     #[default]
@@ -98,7 +88,6 @@ enum DiscoveryPhase {
 
 struct Window {
     settings: Settings,
-    panel: Panel,
     children: Vec<Control>,
     render_cursor: usize,
     rendered_height: i32,
@@ -269,11 +258,7 @@ impl Window {
 
         let freezing = self.watching && self.discovery_phase == DiscoveryPhase::Freezing;
         let show_update = !self.update_message.is_empty();
-        let height = match self.panel {
-            Panel::Main if freezing => 378,
-            Panel::Main => 293,
-            Panel::Talents => 292,
-        } + if show_update { 38 } else { 0 };
+        let height = if show_update { 416 } else { 378 };
         let mut outer = RECT {
             left: 0,
             top: 0,
@@ -296,10 +281,7 @@ impl Window {
             self.rendered_height = height;
         }
 
-        match self.panel {
-            Panel::Main => self.render_overview(hwnd, freezing),
-            Panel::Talents => self.render_talents(hwnd),
-        }
+        self.render_overview(hwnd, freezing);
         self.render_footer(hwnd, height);
         for control in self.children.drain(self.render_cursor..) {
             if !control.hwnd.is_null() {
@@ -337,9 +319,9 @@ impl Window {
         } else if self.watching {
             ("Stop watcher", STOP)
         } else {
-            ("Start solo freeze", START)
+            ("Start watcher", START)
         };
-        self.button(hwnd, label, [18, 16, 148, 36], action);
+        self.button(hwnd, label, [18, 16, 227, 36], action);
         let (launch_label, launch_action, launch_style) = if self.running {
             ("Game running", LAUNCH, WS_DISABLED)
         } else if configured {
@@ -352,10 +334,9 @@ impl Window {
             "BUTTON",
             launch_label,
             WS_TABSTOP | BS_OWNERDRAW as u32 | launch_style,
-            [176, 16, 148, 36],
+            [255, 16, 227, 36],
             launch_action,
         );
-        self.button(hwnd, "Max Talents", [334, 16, 148, 36], TALENTS);
         self.text(hwnd, "", [18, 65, 464, 1], DIVIDER);
 
         let (status, detail) = if !configured {
@@ -377,10 +358,7 @@ impl Window {
                     "Finding your character",
                     "Open the character panel (C) so the watcher can identify you.",
                 ),
-                DiscoveryPhase::Freezing => (
-                    "Stats frozen",
-                    "Targets are reapplied after the game recalculates them.",
-                ),
+                DiscoveryPhase::Freezing => ("Stats frozen", ""),
                 DiscoveryPhase::Retrying => (
                     "Reconnecting",
                     "The watcher will look for the character record again.",
@@ -407,48 +385,17 @@ impl Window {
             )
         {
             self.discovery_message.clone()
+        } else if freezing {
+            format!(
+                "Rewriting every {:.1} seconds.",
+                discovery::POLL_INTERVAL.as_secs_f32()
+            )
         } else {
             detail.to_owned()
         };
         self.text(hwnd, &detail, [42, 108, 440, 36], MUTED_TEXT);
 
-        let panel_y = if freezing {
-            self.text(hwnd, "Frozen targets", [18, 146, 220, 20], 0);
-            let interval = format!(
-                "{} active  ·  {:.1} s interval",
-                discovery::TARGETS.len(),
-                discovery::POLL_INTERVAL.as_secs_f32()
-            );
-            self.child(
-                hwnd,
-                "STATIC",
-                &interval,
-                SS_RIGHT | SS_NOPREFIX,
-                [252, 146, 230, 20],
-                LIVE_TEXT,
-            );
-            for (index, target) in discovery::TARGETS.iter().enumerate() {
-                let x = if index % 2 == 0 { 18 } else { 255 };
-                let y = 173 + (index / 2) as i32 * 62;
-                let caption = format!("{}\n{}", target.name, target.displayed_bonus());
-                let tile = self.child(
-                    hwnd,
-                    "STATIC",
-                    &caption,
-                    SS_OWNERDRAW,
-                    [x, y, 227, 53],
-                    STAT_CARD,
-                );
-                set_font(tile, self.heading_font.handle());
-            }
-            303
-        } else {
-            150
-        };
-        if !freezing {
-            self.render_character_panel(hwnd, panel_y);
-        }
-        let metadata_y = if freezing { panel_y + 5 } else { panel_y + 73 };
+        self.render_stats(hwnd, freezing);
         let build = self
             .build
             .as_deref()
@@ -457,92 +404,50 @@ impl Window {
         self.text(
             hwnd,
             &format!("Game build  {build}"),
-            [18, metadata_y, 264, 20],
+            [18, 308, 264, 20],
             MUTED_TEXT,
         );
         if self.watching {
             self.child(
                 hwnd,
                 "STATIC",
-                "Solo mode",
+                "Solo / host mode",
                 SS_RIGHT | SS_NOPREFIX,
-                [331, metadata_y, 151, 20],
+                [331, 308, 151, 20],
                 MUTED_TEXT,
             );
         }
     }
 
-    fn render_character_panel(&mut self, hwnd: HWND, top: i32) {
-        self.text(hwnd, "Character panel", [18, top, 230, 20], 0);
-        let readings: Vec<_> = [
-            ("Damage ", "Damage"),
-            ("Area ", "Area"),
-            ("Gold ", "Gold Bonus"),
-            ("Luck ", "Luck"),
-        ]
-        .into_iter()
-        .filter_map(|(prefix, label)| {
-            self.reading
-                .stats
-                .iter()
-                .find_map(|stat| stat.strip_prefix(prefix))
-                .map(|value| format!("{label} {value}"))
-        })
-        .collect();
-        if readings.is_empty() {
-            let hint = if self.watching && self.running {
-                "Press C in the game to show live readings."
+    fn render_stats(&mut self, hwnd: HWND, freezing: bool) {
+        self.text(hwnd, "Stats", [18, 146, 220, 20], 0);
+        for (index, target) in discovery::TARGETS.iter().enumerate() {
+            let value = if freezing {
+                target.displayed_bonus()
             } else {
-                "Live readings appear while the watcher runs."
+                self.reading
+                    .stats
+                    .iter()
+                    .find_map(|stat| {
+                        stat.strip_prefix(target.panel_label)
+                            .and_then(|suffix| suffix.strip_prefix(' '))
+                    })
+                    .unwrap_or("—")
+                    .to_owned()
             };
-            self.text(hwnd, hint, [18, top + 24, 464, 23], MUTED_TEXT);
-            return;
-        }
-        for (index, reading) in readings.iter().enumerate() {
+            let caption = format!("{}\n{value}", target.name);
             let x = 18 + (index % 2) as i32 * 237;
-            let y = top + 25 + (index / 2) as i32 * 22;
-            self.text(hwnd, reading, [x, y, 227, 20], MUTED_TEXT);
+            let y = 173 + (index / 2) as i32 * 62;
+            let tile = self.child(
+                hwnd,
+                "STATIC",
+                &caption,
+                SS_OWNERDRAW,
+                [x, y, 227, 53],
+                STAT_CARD,
+            );
+            set_font(tile, self.heading_font.handle());
         }
-    }
-
-    fn render_talents(&mut self, hwnd: HWND) {
-        self.button(hwnd, "Back to trainer", [18, 16, 148, 36], BACK);
-        self.text(hwnd, "", [18, 65, 464, 1], DIVIDER);
-        self.heading(hwnd, "Max Talents", [18, 76, 380, 28]);
-        self.text(
-            hwnd,
-            "Talent editing is unavailable in this build.",
-            [18, 109, 464, 22],
-            MUTED_TEXT,
-        );
-        let cap = format!("Raise talent cap to {}", self.settings.talent_cap());
-        let class = format!("Max talents for {}", self.settings.talent_class());
-        self.child(
-            hwnd,
-            "BUTTON",
-            &cap,
-            WS_DISABLED | BS_OWNERDRAW as u32,
-            [18, 146, 190, 30],
-            0,
-        );
-        self.child(
-            hwnd,
-            "BUTTON",
-            "Restore 51",
-            WS_DISABLED | BS_OWNERDRAW as u32,
-            [218, 146, 116, 30],
-            0,
-        );
-        self.text(hwnd, &class, [18, 187, 300, 22], 0);
-        self.child(
-            hwnd,
-            "BUTTON",
-            "Create save",
-            WS_DISABLED | BS_OWNERDRAW as u32,
-            [18, 212, 148, 30],
-            0,
-        );
-        self.button(hwnd, "Open Saves folder", [176, 212, 156, 30], SAVES);
     }
 
     fn render_footer(&mut self, hwnd: HWND, height: i32) {
@@ -888,29 +793,8 @@ impl Window {
                     self.log(&self.message);
                 }
             }
-            TALENTS => {
-                self.panel = if self.panel == Panel::Talents {
-                    Panel::Main
-                } else {
-                    Panel::Talents
-                }
-            }
-            BACK => self.panel = Panel::Main,
             GITHUB => open(hwnd, REPO),
             CHECK_UPDATES => self.start_update_check(),
-            SAVES => {
-                if let Some(folder) = self
-                    .settings
-                    .game_path()
-                    .and_then(Path::parent)
-                    .map(|dir| dir.join("Saves"))
-                    .filter(|path| path.is_dir())
-                {
-                    open(hwnd, folder.as_os_str());
-                } else {
-                    self.message = "Saves folder was not found next to the game.".into();
-                }
-            }
             _ => return,
         }
         self.refresh_process();
@@ -1089,7 +973,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
             }
             WM_CTLCOLORSTATIC => {
                 let color = match GetDlgCtrlID(l as HWND) as u16 {
-                    READY_DOT | LIVE_TEXT => LIVE,
+                    READY_DOT => LIVE,
                     STATUS_DOT => rgb(173, 158, 242),
                     MUTED_TEXT => MUTED,
                     DIVIDER => {
@@ -1145,7 +1029,6 @@ fn run() -> std::io::Result<()> {
         let dpi = GetDpiForSystem() as i32;
         let mut window = Window {
             settings,
-            panel: Panel::Main,
             children: Vec::new(),
             render_cursor: 0,
             rendered_height: 0,

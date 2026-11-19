@@ -34,6 +34,7 @@ const VERIFIED_BUILD: &str = "ba09f96a327cadc24371b9dd8d876418c8d6dde298847fab31
 
 pub struct Target {
     pub name: &'static str,
+    pub panel_label: &'static str,
     offset: usize,
     value: f32,
     baseline: f32,
@@ -48,24 +49,28 @@ impl Target {
 pub const TARGETS: [Target; 4] = [
     Target {
         name: "Damage",
+        panel_label: "Damage",
         offset: 4,
         value: 100.99,
         baseline: 1.0,
     },
     Target {
         name: "Area",
+        panel_label: "Area",
         offset: 44,
         value: 100.99,
         baseline: 1.0,
     },
     Target {
         name: "Luck",
+        panel_label: "Luck",
         offset: 48,
         value: 99.99,
         baseline: 0.0,
     },
     Target {
         name: "Gold Bonus",
+        panel_label: "Gold",
         offset: 52,
         value: 100.99,
         baseline: 1.0,

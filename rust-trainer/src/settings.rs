@@ -90,18 +90,4 @@ impl Settings {
         self.fields = updated;
         Ok(())
     }
-
-    pub fn talent_class(&self) -> &str {
-        self.fields
-            .get("max_talent_class")
-            .and_then(Value::as_str)
-            .unwrap_or("All classes")
-    }
-
-    pub fn talent_cap(&self) -> u64 {
-        self.fields
-            .get("talent_cap")
-            .and_then(Value::as_u64)
-            .unwrap_or(150)
-    }
 }
