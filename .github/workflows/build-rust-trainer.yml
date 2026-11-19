@@ -1,0 +1,41 @@
+name: Build Rust trainer
+
+on:
+  push:
+    paths:
+      - .github/workflows/build-rust-trainer.yml
+      - assets/trainer-icon.ico
+      - rust-trainer/**
+  pull_request:
+    paths:
+      - .github/workflows/build-rust-trainer.yml
+      - assets/trainer-icon.ico
+      - rust-trainer/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.93.0-x86_64-pc-windows-msvc --profile minimal
+      - name: Build Windows executable
+        run: cargo +1.93.0-x86_64-pc-windows-msvc build --locked --release --manifest-path rust-trainer/Cargo.toml --target-dir build/rust-ci
+      - name: Stage executable
+        run: |
+          New-Item -ItemType Directory -Path build/artifact -Force | Out-Null
+          Copy-Item -LiteralPath build/rust-ci/release/azeroth-survivors-trainer.exe -Destination build/artifact/AzerothSurvivorsTrainer.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AzerothSurvivorsTrainer-windows-x64
+          path: build/artifact/AzerothSurvivorsTrainer.exe
+          if-no-files-found: error
