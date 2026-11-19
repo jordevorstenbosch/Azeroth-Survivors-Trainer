@@ -1,9 +1,10 @@
 # Building the trainer
 
-Use the **Build Rust trainer** GitHub Actions workflow for Windows executable
-builds. Push build inputs to trigger the workflow and retrieve the executable
-from the workflow run's artifacts. Use a successful Actions artifact when
-packaging a Rust trainer release.
+GitHub Actions always builds the Windows trainer, including the latest
+release. Use the **Build Rust trainer** workflow for every Windows build.
+For a release, push the release commit to `main` and wait for that commit's
+workflow run to pass. Publish its `AzerothSurvivorsTrainer.exe` artifact as
+the Windows release asset.
 
 # Trainer watcher behavior
 
