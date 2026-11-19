@@ -24,6 +24,24 @@ pub struct Reading {
     pub stats: Vec<String>,
 }
 
+impl Reading {
+    pub fn has_character_panel(&self) -> bool {
+        let character_fields = [
+            "HP ", "Damage ", "Haste ", "Crit ", "Armor ", "Area ", "Echo ", "Speed ",
+        ];
+        self.stats
+            .iter()
+            .filter(|stat| {
+                character_fields
+                    .iter()
+                    .any(|prefix| stat.starts_with(*prefix))
+            })
+            .take(2)
+            .count()
+            == 2
+    }
+}
+
 // Coordinates are fractions of the full client area, as in the legacy reader.
 const STAT_PANELS: [[f32; 4]; 2] = [[0.03, 0.44, 0.25, 0.60], [0.22, 0.12, 0.37, 0.36]];
 

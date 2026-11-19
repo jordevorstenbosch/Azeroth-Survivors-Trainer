@@ -222,34 +222,27 @@ impl Window {
         } else {
             "Waiting for the game"
         };
-        let description = if !self.message.is_empty() {
+        let waiting_for_panel = self.watching && !self.reading.has_character_panel();
+        let description = if waiting_for_panel {
+            "Open Character Panel (Press C) and let trainer find values".into()
+        } else if !self.message.is_empty() {
             self.message.clone()
         } else if !configured {
             "Locate AzerothSurvivors.exe to begin.".into()
-        } else if self.watching && self.running {
-            if self.reading.stats.is_empty() {
-                if self.capture_error.is_some() {
-                    "Game detected. Could not read the game window.".into()
-                } else {
-                    "Open your character sheet to see detected values.".into()
-                }
-            } else {
-                format!(
-                    "{} values detected on the character sheet.",
-                    self.reading.stats.len()
-                )
-            }
         } else if self.watching {
-            "Launch the game or wait for it to open.".into()
+            format!(
+                "{} values detected on the character sheet.",
+                self.reading.stats.len()
+            )
         } else {
-            "Press Start to read your character sheet with OCR.".into()
+            "Start the watcher to read your character sheet.".into()
         };
         let toggle = if !configured {
             "Locate game"
         } else if self.watching {
-            "Stop watcher"
+            "Stop Watcher"
         } else {
-            "Start"
+            "Start Watcher"
         };
         self.button(
             hwnd,
@@ -286,25 +279,27 @@ impl Window {
         }
         self.child(hwnd, "STATIC", &description, 0, [43, 98, 390, 36], 0);
 
-        let build = self.build.clone().unwrap_or_else(|| "—".into());
-        let mut visible = self.reading.stats.chunks(2);
-        let first = visible
-            .next()
-            .map_or_else(|| "—".into(), |row| row.join("  ·  "));
-        let second = visible
-            .next()
-            .map_or_else(String::new, |row| row.join("  ·  "));
-        let rows = [
-            ("Game build", build.as_str()),
-            ("Visible stats", &first),
-            ("", &second),
-            ("Stats applied", "0"),
-        ];
-        for (index, (label, value)) in rows.into_iter().enumerate() {
-            let top = 137 + index as i32 * 23;
-            self.child(hwnd, "STATIC", label, 0, [18, top, 171, 19], 0);
-            self.child(hwnd, "STATIC", value, 0, [201, top, 232, 19], 0);
-            self.child(hwnd, "STATIC", "", 0, [16, top + 19, 418, 1], DIVIDER);
+        if !waiting_for_panel {
+            let build = self.build.clone().unwrap_or_else(|| "—".into());
+            let mut visible = self.reading.stats.chunks(2);
+            let first = visible
+                .next()
+                .map_or_else(|| "—".into(), |row| row.join("  ·  "));
+            let second = visible
+                .next()
+                .map_or_else(String::new, |row| row.join("  ·  "));
+            let rows = [
+                ("Game build", build.as_str()),
+                ("Visible stats", &first),
+                ("", &second),
+                ("Stats applied", "0"),
+            ];
+            for (index, (label, value)) in rows.into_iter().enumerate() {
+                let top = 137 + index as i32 * 23;
+                self.child(hwnd, "STATIC", label, 0, [18, top, 171, 19], 0);
+                self.child(hwnd, "STATIC", value, 0, [201, top, 232, 19], 0);
+                self.child(hwnd, "STATIC", "", 0, [16, top + 19, 418, 1], DIVIDER);
+            }
         }
 
         match self.panel {
