@@ -2,18 +2,20 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io,
-    os::windows::ffi::OsStrExt,
     path::Path,
     process::{Command, Stdio},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, ERROR_NO_MORE_FILES, FILETIME, INVALID_HANDLE_VALUE},
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
             TH32CS_SNAPPROCESS,
         },
-        Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW},
+        Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
+        },
     },
 };
 
@@ -32,8 +34,26 @@ pub fn build_id(path: &Path) -> io::Result<String> {
     Ok(digest[..12].to_owned())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessInstance {
+    pub pid: u32,
+    pub created: Option<u64>,
+}
+
+pub fn running_instance(path: &Path) -> io::Result<Option<ProcessInstance>> {
+    find_process(path, true)
+}
+
 pub fn running_pid(path: &Path) -> io::Result<Option<u32>> {
-    let wanted = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    Ok(legacy_instance(path)?.map(|process| process.pid))
+}
+
+pub fn legacy_instance(path: &Path) -> io::Result<Option<ProcessInstance>> {
+    find_process(path, false)
+}
+
+fn find_process(path: &Path, require_creation_time: bool) -> io::Result<Option<ProcessInstance>> {
+    let wanted = path.to_string_lossy();
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
     unsafe {
@@ -43,8 +63,8 @@ pub fn running_pid(path: &Path) -> io::Result<Option<u32>> {
         }
         let mut present = None;
         let mut unreadable = None;
+        let mut matching_paths = 0;
         let mut more = Process32FirstW(snapshot, &mut entry);
-        let initial_error = (more == 0).then(io::Error::last_os_error);
         let mut buffer = vec![0u16; 32768];
         while more != 0 {
             let end = entry
@@ -63,22 +83,52 @@ pub fn running_pid(path: &Path) -> io::Result<Option<u32>> {
                         unreadable = Some(io::Error::last_os_error());
                     } else {
                         let actual = String::from_utf16_lossy(&buffer[..size as usize]);
-                        if actual.eq_ignore_ascii_case(&String::from_utf16_lossy(&wanted)) {
-                            present = Some(entry.th32ProcessID);
+                        if actual.eq_ignore_ascii_case(&wanted) {
+                            matching_paths += 1;
+                            let pid = entry.th32ProcessID;
+                            if require_creation_time {
+                                let mut created = FILETIME::default();
+                                let mut exited = FILETIME::default();
+                                let mut kernel = FILETIME::default();
+                                let mut user = FILETIME::default();
+                                if GetProcessTimes(
+                                    handle,
+                                    &mut created,
+                                    &mut exited,
+                                    &mut kernel,
+                                    &mut user,
+                                ) == 0
+                                {
+                                    unreadable = Some(io::Error::last_os_error());
+                                } else {
+                                    let created = (u64::from(created.dwHighDateTime) << 32)
+                                        | u64::from(created.dwLowDateTime);
+                                    present = Some(ProcessInstance {
+                                        pid,
+                                        created: Some(created),
+                                    });
+                                }
+                            } else {
+                                present = Some(ProcessInstance { pid, created: None });
+                            }
                         }
                     }
                     CloseHandle(handle);
-                    if present.is_some() {
-                        break;
-                    }
                 }
             }
             more = Process32NextW(snapshot, &mut entry);
         }
+        let enumeration_end = io::Error::last_os_error();
         CloseHandle(snapshot);
-        if present.is_some() {
+        if enumeration_end.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+            Err(enumeration_end)
+        } else if matching_paths > 1 {
+            Err(io::Error::other(
+                "Multiple game processes match the configured path.",
+            ))
+        } else if present.is_some() {
             Ok(present)
-        } else if let Some(error) = initial_error.or(unreadable) {
+        } else if let Some(error) = unreadable {
             Err(error)
         } else {
             Ok(None)

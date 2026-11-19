@@ -54,6 +54,7 @@ const STATUS_DOT: u16 = 108;
 const READY_DOT: u16 = 109;
 const DIVIDER: u16 = 110;
 const LOCATE: u16 = 111;
+const PROCESS_LOOKUP_LIMIT: u8 = 10;
 const BACKGROUND: u32 = 0x242323;
 const TEXT: u32 = 0xf7f4f4;
 const SECONDARY: u32 = 0x323030;
@@ -78,7 +79,8 @@ struct Window {
     heading_font: Font,
     watching: bool,
     running: bool,
-    game_pid: Option<u32>,
+    game_instance: Option<game::ProcessInstance>,
+    process_lookup_misses: u8,
     build: Option<String>,
     reading: hud::Reading,
     capture: Option<(u64, Receiver<hud::Scan>)>,
@@ -413,9 +415,25 @@ impl Window {
             return false;
         }
         self.message.clear();
-        self.build = None;
-        self.running = false;
+        self.process_lookup_misses = 0;
+        self.set_game_instance(None);
         self.log("Game executable configured.");
+        true
+    }
+
+    fn set_game_instance(&mut self, instance: Option<game::ProcessInstance>) -> bool {
+        if self.game_instance == instance {
+            return false;
+        }
+        self.game_instance = instance;
+        self.running = instance.is_some();
+        self.build = None;
+        self.reset_scan();
+        self.log(match instance {
+            Some(process) if process.created.is_some() => "Game process identity verified.",
+            Some(_) => "Game detected using legacy PID and executable path lookup.",
+            None => "Game process no longer identified.",
+        });
         true
     }
 
@@ -426,47 +444,49 @@ impl Window {
             .filter(|path| game::valid_path(path))
             .map(Path::to_owned)
         else {
-            return false;
+            self.process_lookup_misses = 0;
+            return self.set_game_instance(None);
         };
-        match game::running_pid(&path) {
-            Ok(pid) => {
-                let changed = pid != self.game_pid;
-                let running = pid.is_some();
-                self.running = running;
-                if changed {
-                    self.game_pid = pid;
-                    self.build = None;
-                    self.reset_scan();
-                    self.log(if running {
-                        "Game detected."
-                    } else {
-                        "Game closed."
-                    });
-                }
-                let mut refresh = changed;
-                if self.watching && running && self.build.is_none() {
-                    match game::build_id(&path) {
-                        Ok(build) => {
-                            self.log(&format!(
-                                "Configured game executable SHA-256 prefix: {build}"
-                            ));
-                            self.build = Some(build);
-                            refresh = true;
-                        }
-                        Err(error) => {
-                            let message = format!("Could not identify the game build. {error}");
-                            if self.message != message {
-                                self.log(&message);
-                                self.message = message;
-                                refresh = true;
-                            }
-                        }
+        let instance = match game::running_instance(&path) {
+            Ok(Some(instance)) => {
+                self.process_lookup_misses = 0;
+                Some(instance)
+            }
+            Ok(None) | Err(_) => {
+                if self.process_lookup_misses < PROCESS_LOOKUP_LIMIT {
+                    self.process_lookup_misses += 1;
+                    if self.process_lookup_misses == PROCESS_LOOKUP_LIMIT {
+                        self.log("Process identity lookup missed 10 times. Trying legacy lookup.");
                     }
                 }
-                self.poll_hud() || refresh
+                if self.process_lookup_misses == PROCESS_LOOKUP_LIMIT {
+                    game::legacy_instance(&path).ok().flatten()
+                } else {
+                    None
+                }
             }
-            _ => false,
+        };
+        let mut refresh = self.set_game_instance(instance);
+        if self.watching && self.running && self.build.is_none() {
+            match game::build_id(&path) {
+                Ok(build) => {
+                    self.log(&format!(
+                        "Configured game executable SHA-256 prefix: {build}"
+                    ));
+                    self.build = Some(build);
+                    refresh = true;
+                }
+                Err(error) => {
+                    let message = format!("Could not identify the game build. {error}");
+                    if self.message != message {
+                        self.log(&message);
+                        self.message = message;
+                        refresh = true;
+                    }
+                }
+            }
         }
+        self.poll_hud() || refresh
     }
 
     fn poll_hud(&mut self) -> bool {
@@ -513,11 +533,11 @@ impl Window {
             }
         }
         if self.watching && self.capture.is_none() && Instant::now() >= self.next_capture {
-            if let Some(pid) = self.game_pid {
+            if let Some(process) = self.game_instance {
                 let misses = self.primary_misses;
                 let (sender, receiver) = mpsc::sync_channel(1);
                 std::thread::spawn(move || {
-                    let _ = sender.send(hud::scan(pid, misses));
+                    let _ = sender.send(hud::scan(process.pid, misses));
                 });
                 self.capture = Some((self.scan_generation, receiver));
                 self.next_capture = Instant::now() + Duration::from_secs(4);
@@ -786,7 +806,8 @@ fn run() -> std::io::Result<()> {
             heading_font: Font::new(dpi, 20, 600),
             watching: env::args_os().any(|arg| arg == "--autostart"),
             running: false,
-            game_pid: None,
+            game_instance: None,
+            process_lookup_misses: 0,
             build: None,
             reading: hud::Reading::default(),
             capture: None,
