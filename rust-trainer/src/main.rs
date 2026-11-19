@@ -23,20 +23,20 @@ use windows_sys::Win32::{
         Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
         Gdi::{
             CreateFontW, CreateSolidBrush, DC_BRUSH, DEFAULT_GUI_FONT as UI_FONT, DT_CENTER,
-            DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject,
-            DrawFocusRect, DrawTextW, FillRect, GetStockObject, HFONT, SelectObject, SetBkMode,
-            SetDCBrushColor, SetTextColor, TRANSPARENT,
+            DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW,
+            FillRect, GetStockObject, HFONT, SelectObject, SetBkMode, SetDCBrushColor,
+            SetTextColor, TRANSPARENT,
         },
     },
     System::{
         LibraryLoader::GetModuleHandleW,
-        SystemServices::{SS_NOPREFIX, SS_OWNERDRAW, SS_RIGHT},
+        SystemServices::{SS_NOPREFIX, SS_RIGHT},
     },
     UI::{
         Controls::{
             DRAWITEMSTRUCT,
             Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW},
-            ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, ODT_STATIC,
+            ODS_DISABLED, ODS_FOCUS, ODS_SELECTED,
         },
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem},
         Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled, SetFocus},
@@ -46,6 +46,7 @@ use windows_sys::Win32::{
 };
 
 const TITLE: &str = "Azeroth Survivors Trainer";
+const CHARACTER_PANEL_PROMPT: &str = "Open Character Panel (press C in-game)";
 const REPO: &str = "https://github.com/nelbin4/Azeroth-Survivors-Trainer";
 const START: u16 = 100;
 const LAUNCH: u16 = 101;
@@ -58,7 +59,6 @@ const DIVIDER: u16 = 110;
 const LOCATE: u16 = 111;
 const STOP: u16 = 112;
 const MUTED_TEXT: u16 = 113;
-const STAT_CARD: u16 = 115;
 const PROCESS_LOOKUP_LIMIT: u8 = 10;
 const BACKGROUND: u32 = rgb(22, 23, 30);
 const TEXT: u32 = rgb(242, 241, 247);
@@ -266,7 +266,7 @@ impl Window {
 
         let freezing = self.watching && self.discovery_phase == DiscoveryPhase::Freezing;
         let show_update = !self.update_message.is_empty();
-        let height = if show_update { 416 } else { 378 };
+        let height = if show_update { 266 } else { 228 };
         let mut outer = RECT {
             left: 0,
             top: 0,
@@ -362,10 +362,9 @@ impl Window {
                     "Discovering stats",
                     "Looking for the live character record.",
                 ),
-                DiscoveryPhase::WaitingForPanel => (
-                    "Finding your character",
-                    "Open the character panel (C) so the watcher can identify you.",
-                ),
+                DiscoveryPhase::WaitingForPanel => {
+                    ("Finding your character", CHARACTER_PANEL_PROMPT)
+                }
                 DiscoveryPhase::Freezing => ("Stats frozen", ""),
                 DiscoveryPhase::Retrying => (
                     "Reconnecting",
@@ -384,7 +383,13 @@ impl Window {
             if freezing { READY_DOT } else { STATUS_DOT },
         );
         self.heading(hwnd, status, [42, 76, 440, 29]);
-        let detail = if !self.message.is_empty() {
+        let detail = if configured
+            && self.watching
+            && self.running
+            && self.discovery_phase == DiscoveryPhase::WaitingForPanel
+        {
+            CHARACTER_PANEL_PROMPT.to_owned()
+        } else if !self.message.is_empty() {
             self.message.clone()
         } else if !self.discovery_message.is_empty()
             && matches!(
@@ -403,7 +408,6 @@ impl Window {
         };
         self.text(hwnd, &detail, [42, 108, 440, 36], MUTED_TEXT);
 
-        self.render_stats(hwnd, freezing);
         let build = self
             .build
             .as_deref()
@@ -412,7 +416,7 @@ impl Window {
         self.text(
             hwnd,
             &format!("Game build  {build}"),
-            [18, 308, 264, 20],
+            [18, 151, 264, 20],
             MUTED_TEXT,
         );
         if self.watching {
@@ -421,40 +425,9 @@ impl Window {
                 "STATIC",
                 "Solo / host mode",
                 SS_RIGHT | SS_NOPREFIX,
-                [331, 308, 151, 20],
+                [331, 151, 151, 20],
                 MUTED_TEXT,
             );
-        }
-    }
-
-    fn render_stats(&mut self, hwnd: HWND, freezing: bool) {
-        self.text(hwnd, "Stats", [18, 146, 220, 20], 0);
-        for (index, target) in discovery::TARGETS.iter().enumerate() {
-            let value = if freezing {
-                target.displayed_bonus()
-            } else {
-                self.reading
-                    .stats
-                    .iter()
-                    .find_map(|stat| {
-                        stat.strip_prefix(target.panel_label)
-                            .and_then(|suffix| suffix.strip_prefix(' '))
-                    })
-                    .unwrap_or("—")
-                    .to_owned()
-            };
-            let caption = format!("{}\n{value}", target.name);
-            let x = 18 + (index % 2) as i32 * 237;
-            let y = 173 + (index / 2) as i32 * 62;
-            let tile = self.child(
-                hwnd,
-                "STATIC",
-                &caption,
-                SS_OWNERDRAW,
-                [x, y, 227, 53],
-                STAT_CARD,
-            );
-            set_font(tile, self.heading_font.handle());
         }
     }
 
@@ -562,7 +535,7 @@ impl Window {
             }
         };
         let mut refresh = self.set_game_instance(instance);
-        refresh |= self.poll_hud();
+        self.poll_hud();
         refresh |= self.poll_discovery(&path);
         refresh
     }
@@ -627,7 +600,7 @@ impl Window {
             let Some(name) = name else {
                 return self.set_discovery_status(
                     DiscoveryPhase::WaitingForPanel,
-                    "Open the character panel (C).".into(),
+                    CHARACTER_PANEL_PROMPT.into(),
                 );
             };
             match discovery::Job::start(
@@ -668,8 +641,7 @@ impl Window {
         changed
     }
 
-    fn poll_hud(&mut self) -> bool {
-        let mut refreshed = false;
+    fn poll_hud(&mut self) {
         if let Some((generation, receiver)) = &self.capture {
             let generation = *generation;
             let result = match receiver.try_recv() {
@@ -685,9 +657,9 @@ impl Window {
                             if let (Some(job), Some(player)) = (&self.discovery, &reading.player) {
                                 job.observe(player.clone());
                             }
-                            refreshed |= self.capture_error.take().is_some()
+                            let changed = self.capture_error.take().is_some()
                                 || self.reading.stats != reading.stats;
-                            if refreshed && !reading.stats.is_empty() {
+                            if changed && !reading.stats.is_empty() {
                                 self.log(&format!("Visible values: {}", reading.stats.join(", ")));
                             }
                             self.reading = reading;
@@ -696,7 +668,6 @@ impl Window {
                             self.log(&format!("Could not read the game window: {error}"));
                             self.capture_error = Some(error);
                             self.reading = hud::Reading::default();
-                            refreshed = true;
                         }
                         Err(_) => {}
                     }
@@ -717,7 +688,6 @@ impl Window {
                 self.next_capture = Instant::now() + Duration::from_secs(4);
             }
         }
-        refreshed
     }
 
     fn reset_scan(&mut self) {
@@ -914,58 +884,6 @@ fn set_font(hwnd: HWND, font: HFONT) {
     }
 }
 
-fn draw_stat_card(item: &DRAWITEMSTRUCT) {
-    unsafe {
-        let brush = CreateSolidBrush(SECONDARY);
-        FillRect(item.hDC, &item.rcItem, brush);
-        DeleteObject(brush);
-
-        let mut caption = [0u16; 96];
-        let count = GetWindowTextW(item.hwndItem, caption.as_mut_ptr(), caption.len() as i32);
-        let caption = &caption[..count.max(0) as usize];
-        let Some(divider) = caption.iter().position(|&ch| ch == u16::from(b'\n')) else {
-            return;
-        };
-        let (label, value) = caption.split_at(divider);
-        let value = &value[1..];
-
-        let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
-        let old_font = if font.is_null() {
-            null_mut()
-        } else {
-            SelectObject(item.hDC, font.cast())
-        };
-        let scale = |pixels| pixels * (item.rcItem.bottom - item.rcItem.top) / 53;
-        let mut name_rect = item.rcItem;
-        let mut value_rect = item.rcItem;
-        name_rect.left += scale(13);
-        name_rect.right -= scale(88);
-        value_rect.left = name_rect.right;
-        value_rect.right -= scale(13);
-        let flags = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-        SetBkMode(item.hDC, TRANSPARENT as i32);
-        SetTextColor(item.hDC, TEXT);
-        DrawTextW(
-            item.hDC,
-            label.as_ptr(),
-            label.len() as i32,
-            &mut name_rect,
-            flags | DT_END_ELLIPSIS,
-        );
-        SetTextColor(item.hDC, LIVE);
-        DrawTextW(
-            item.hDC,
-            value.as_ptr(),
-            value.len() as i32,
-            &mut value_rect,
-            flags | DT_RIGHT,
-        );
-        if !old_font.is_null() {
-            SelectObject(item.hDC, old_font);
-        }
-    }
-}
-
 fn pick_game(hwnd: HWND) -> Option<PathBuf> {
     let mut path = vec![0u16; 32768];
     let filters = wide("Azeroth Survivors\0AzerothSurvivors.exe\0\0");
@@ -1015,12 +933,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
                 return 0;
             }
             WM_DRAWITEM if l != 0 => {
-                let item = &*(l as *const DRAWITEMSTRUCT);
-                if item.CtlType == ODT_STATIC && item.CtlID == u32::from(STAT_CARD) {
-                    draw_stat_card(item);
-                } else {
-                    draw_button(item);
-                }
+                draw_button(&*(l as *const DRAWITEMSTRUCT));
                 return 1;
             }
             WM_CTLCOLORSTATIC => {

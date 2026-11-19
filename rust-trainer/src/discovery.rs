@@ -32,48 +32,27 @@ const LEVEL_DISTANCE: usize = 104;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const VERIFIED_BUILD: &str = "ba09f96a327cadc24371b9dd8d876418c8d6dde298847fab318847be8c44cc5a";
 
-pub struct Target {
-    pub name: &'static str,
-    pub panel_label: &'static str,
+struct Target {
     offset: usize,
     value: f32,
-    baseline: f32,
 }
 
-impl Target {
-    pub fn displayed_bonus(&self) -> String {
-        format!("{:+.0}%", (self.value - self.baseline) * 100.0)
-    }
-}
-
-pub const TARGETS: [Target; 4] = [
+const TARGETS: [Target; 4] = [
     Target {
-        name: "Damage",
-        panel_label: "Damage",
         offset: 4,
         value: 100.99,
-        baseline: 1.0,
     },
     Target {
-        name: "Area",
-        panel_label: "Area",
         offset: 44,
         value: 100.99,
-        baseline: 1.0,
     },
     Target {
-        name: "Luck",
-        panel_label: "Luck",
         offset: 48,
         value: 99.99,
-        baseline: 0.0,
     },
     Target {
-        name: "Gold Bonus",
-        panel_label: "Gold",
         offset: 52,
         value: 100.99,
-        baseline: 1.0,
     },
 ];
 
@@ -513,10 +492,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn displayed_targets_match_the_game_percentage_conventions() {
+    fn max_values_match_the_verified_game_layout() {
         assert_eq!(
-            TARGETS.map(|target| target.displayed_bonus()),
-            ["+9999%"; 4]
+            TARGETS.map(|target| (target.offset, target.value)),
+            [(4, 100.99), (44, 100.99), (48, 99.99), (52, 100.99)]
         );
     }
 
