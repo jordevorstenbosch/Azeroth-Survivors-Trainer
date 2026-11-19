@@ -7,12 +7,14 @@ packaging a Rust trainer release.
 
 # Trainer watcher behavior
 
-Every watcher entry point must discover the local player's verified stat
-record, immediately apply the configured maximum targets, and keep those
-targets frozen. Discovery is a step in this workflow. Do not offer a
-discovery-only or read-only watcher mode.
+The trainer's purpose is to discover, max, and freeze the local player's
+supported stats as soon as the live record is verified. Every watcher
+entry point follows this workflow. Do not offer a discovery-only or
+read-only watcher mode.
 
-The supported targets are Damage, Area, Gold Bonus, and Luck. Once the
-watcher binds the live record, rewrite all four every 0.5 seconds. Keep
-using that record through level-ups. If the record cannot be verified or
-is lost, show what the watcher is waiting for and retry discovery.
+Discover once per live record and apply the maximum targets immediately.
+Here, freeze means polling and unconditionally rewriting the maximum
+values for Damage, Area, Gold Bonus, and Luck every 0.5 seconds, without
+checking whether individual values reset. Keep using the bound record
+through level-ups. If no record can be verified or the record is lost,
+show what the watcher is waiting for and retry discovery.
