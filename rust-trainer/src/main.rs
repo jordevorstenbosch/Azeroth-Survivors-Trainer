@@ -90,15 +90,18 @@ enum Panel {
 enum DiscoveryPhase {
     #[default]
     Searching,
-    WaitingForLevel,
+    WaitingForPanel,
     Freezing,
     Retrying,
+    Unsupported,
 }
 
 struct Window {
     settings: Settings,
     panel: Panel,
-    children: Vec<HWND>,
+    children: Vec<Control>,
+    render_cursor: usize,
+    rendered_height: i32,
     dpi: i32,
     font: Font,
     heading_font: Font,
@@ -120,6 +123,15 @@ struct Window {
     message: String,
     update_check: Option<Receiver<Result<update::ReleaseStatus, String>>>,
     update_message: String,
+}
+
+struct Control {
+    hwnd: HWND,
+    class: String,
+    style: u32,
+    rect: [i32; 4],
+    id: u16,
+    label: String,
 }
 
 struct Font(HFONT);
@@ -178,7 +190,27 @@ impl Window {
         rect: [i32; 4],
         id: u16,
     ) -> HWND {
-        let [left, top, width, height] = rect.map(|n| self.scaled(n));
+        let index = self.render_cursor;
+        self.render_cursor += 1;
+        let rect = rect.map(|n| self.scaled(n));
+        if let Some(control) = self.children.get_mut(index) {
+            if !control.hwnd.is_null()
+                && control.class == class
+                && control.style == style
+                && control.rect == rect
+                && control.id == id
+            {
+                if control.label != label {
+                    unsafe { SetWindowTextW(control.hwnd, wide(label).as_ptr()) };
+                    control.label = label.to_owned();
+                }
+                return control.hwnd;
+            }
+            if !control.hwnd.is_null() {
+                unsafe { DestroyWindow(control.hwnd) };
+            }
+        }
+        let [left, top, width, height] = rect;
         let child = unsafe {
             let child = CreateWindowExW(
                 0,
@@ -199,8 +231,18 @@ impl Window {
             }
             child
         };
-        if !child.is_null() {
-            self.children.push(child);
+        let control = Control {
+            hwnd: child,
+            class: class.to_owned(),
+            style,
+            rect,
+            id,
+            label: label.to_owned(),
+        };
+        if index == self.children.len() {
+            self.children.push(control);
+        } else {
+            self.children[index] = control;
         }
         child
     }
@@ -220,11 +262,10 @@ impl Window {
         let previous_focus = unsafe { GetFocus() };
         let focused_id = self
             .children
-            .contains(&previous_focus)
+            .iter()
+            .any(|control| control.hwnd == previous_focus && !previous_focus.is_null())
             .then(|| unsafe { GetDlgCtrlID(previous_focus) });
-        for child in self.children.drain(..) {
-            unsafe { DestroyWindow(child) };
-        }
+        self.render_cursor = 0;
 
         let freezing = self.watching && self.discovery_phase == DiscoveryPhase::Freezing;
         let show_update = !self.update_message.is_empty();
@@ -239,17 +280,20 @@ impl Window {
             right: self.scaled(500),
             bottom: self.scaled(height),
         };
-        unsafe {
-            AdjustWindowRectExForDpi(&mut outer, WINDOW_STYLE, 0, 0, self.dpi as u32);
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                0,
-                0,
-                outer.right - outer.left,
-                outer.bottom - outer.top,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+        if self.rendered_height != height {
+            unsafe {
+                AdjustWindowRectExForDpi(&mut outer, WINDOW_STYLE, 0, 0, self.dpi as u32);
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    outer.right - outer.left,
+                    outer.bottom - outer.top,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            self.rendered_height = height;
         }
 
         match self.panel {
@@ -257,13 +301,21 @@ impl Window {
             Panel::Talents => self.render_talents(hwnd),
         }
         self.render_footer(hwnd, height);
+        for control in self.children.drain(self.render_cursor..) {
+            if !control.hwnd.is_null() {
+                unsafe { DestroyWindow(control.hwnd) };
+            }
+        }
         if let Some(id) = focused_id {
             let mut control = unsafe { GetDlgItem(hwnd, id) };
             if control.is_null() && (id == i32::from(START) || id == i32::from(STOP)) {
                 let toggle = if self.watching { STOP } else { START };
                 control = unsafe { GetDlgItem(hwnd, i32::from(toggle)) };
             }
-            if !control.is_null() && unsafe { IsWindowEnabled(control) } != 0 {
+            if !control.is_null()
+                && control != previous_focus
+                && unsafe { IsWindowEnabled(control) } != 0
+            {
                 unsafe { SetFocus(control) };
             }
         }
@@ -275,9 +327,7 @@ impl Window {
 
     fn heading(&mut self, hwnd: HWND, label: &str, rect: [i32; 4]) {
         let control = self.text(hwnd, label, rect, 0);
-        if !control.is_null() {
-            unsafe { SendMessageW(control, WM_SETFONT, self.heading_font.handle() as usize, 1) };
-        }
+        set_font(control, self.heading_font.handle());
     }
 
     fn render_overview(&mut self, hwnd: HWND, freezing: bool) {
@@ -287,7 +337,7 @@ impl Window {
         } else if self.watching {
             ("Stop watcher", STOP)
         } else {
-            ("Start watcher", START)
+            ("Start solo freeze", START)
         };
         self.button(hwnd, label, [18, 16, 148, 36], action);
         let (launch_label, launch_action, launch_style) = if self.running {
@@ -323,9 +373,9 @@ impl Window {
                     "Discovering stats",
                     "Looking for the live character record.",
                 ),
-                DiscoveryPhase::WaitingForLevel => (
-                    "Waiting for a level-up",
-                    "Level up once so the watcher can identify your solo character.",
+                DiscoveryPhase::WaitingForPanel => (
+                    "Finding your character",
+                    "Open the character panel (C) so the watcher can identify you.",
                 ),
                 DiscoveryPhase::Freezing => (
                     "Stats frozen",
@@ -334,6 +384,10 @@ impl Window {
                 DiscoveryPhase::Retrying => (
                     "Reconnecting",
                     "The watcher will look for the character record again.",
+                ),
+                DiscoveryPhase::Unsupported => (
+                    "Unsupported game build",
+                    "Freezing requires a verified game build.",
                 ),
             }
         };
@@ -349,7 +403,7 @@ impl Window {
         } else if !self.discovery_message.is_empty()
             && matches!(
                 self.discovery_phase,
-                DiscoveryPhase::Searching | DiscoveryPhase::Retrying
+                DiscoveryPhase::Searching | DiscoveryPhase::Retrying | DiscoveryPhase::Unsupported
             )
         {
             self.discovery_message.clone()
@@ -385,11 +439,7 @@ impl Window {
                     [x, y, 227, 53],
                     STAT_CARD,
                 );
-                if !tile.is_null() {
-                    unsafe {
-                        SendMessageW(tile, WM_SETFONT, self.heading_font.handle() as usize, 1)
-                    };
-                }
+                set_font(tile, self.heading_font.handle());
             }
             303
         } else {
@@ -407,7 +457,7 @@ impl Window {
             [18, panel_y + 73, 264, 20],
             MUTED_TEXT,
         );
-        if self.solo_character.is_some() {
+        if self.watching {
             self.child(
                 hwnd,
                 "STATIC",
@@ -600,7 +650,7 @@ impl Window {
     }
 
     fn poll_discovery(&mut self, path: &Path) -> bool {
-        if !self.watching {
+        if !self.watching || self.discovery_phase == DiscoveryPhase::Unsupported {
             return false;
         }
         let Some(instance) = self.game_instance else {
@@ -627,39 +677,21 @@ impl Window {
                         self.log(&format!("Game build SHA-256: {}", report.build));
                         self.build = Some(report.build);
                     }
-                    match (
-                        report.freezing,
-                        report.awaiting_progress,
-                        report.candidates,
-                        report.unreadable_chunks,
-                    ) {
-                        (true, _, _, _) => (
+                    if report.freezing {
+                        (
                             DiscoveryPhase::Freezing,
                             "Freezing Damage, Area, Luck, and Gold Bonus every 0.5 seconds.".into(),
-                        ),
-                        (_, true, _, _) => (
-                            DiscoveryPhase::WaitingForLevel,
-                            "Waiting for the named solo character to level up.".into(),
-                        ),
-                        (_, _, 0, 0) => (
+                        )
+                    } else {
+                        (
                             DiscoveryPhase::Searching,
-                            "Searching game memory for a stat record.".into(),
-                        ),
-                        (_, _, 0, _) => (
-                            DiscoveryPhase::Retrying,
-                            "Some memory could not be read. Retrying discovery.".into(),
-                        ),
-                        (_, _, 1, _) => (
-                            DiscoveryPhase::Searching,
-                            "Found a possible record. Verifying the local character.".into(),
-                        ),
-                        (_, _, count, _) => (
-                            DiscoveryPhase::Searching,
-                            format!(
-                                "Found {count} possible records. Local character is unverified."
-                            ),
-                        ),
+                            "Matching the live record to your character panel.".into(),
+                        )
                     }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                    self.discovery = None;
+                    (DiscoveryPhase::Unsupported, error.to_string())
                 }
                 Err(error) => (
                     DiscoveryPhase::Retrying,
@@ -667,7 +699,26 @@ impl Window {
                 ),
             })
         } else if Instant::now() >= self.next_discovery {
-            match discovery::Job::start(path.to_owned(), instance, self.solo_character.clone()) {
+            let named_override = self.solo_character.is_some();
+            let name = self.solo_character.clone().or_else(|| {
+                self.reading
+                    .player
+                    .as_ref()
+                    .map(|player| player.name.clone())
+            });
+            let Some(name) = name else {
+                return self.set_discovery_status(
+                    DiscoveryPhase::WaitingForPanel,
+                    "Open the character panel (C).".into(),
+                );
+            };
+            match discovery::Job::start(
+                path.to_owned(),
+                instance,
+                name,
+                self.reading.player.clone(),
+                named_override,
+            ) {
                 Ok(job) => {
                     self.discovery = Some(job);
                     None
@@ -684,15 +735,19 @@ impl Window {
             None
         };
         if let Some((phase, update)) = update {
-            let changed = self.discovery_phase != phase || self.discovery_message != update;
-            if changed {
-                self.log(&update);
-                self.discovery_phase = phase;
-                self.discovery_message = update;
-            }
-            return changed;
+            return self.set_discovery_status(phase, update);
         }
         false
+    }
+
+    fn set_discovery_status(&mut self, phase: DiscoveryPhase, update: String) -> bool {
+        let changed = self.discovery_phase != phase || self.discovery_message != update;
+        if changed {
+            self.log(&update);
+            self.discovery_phase = phase;
+            self.discovery_message = update;
+        }
+        changed
     }
 
     fn poll_hud(&mut self) -> bool {
@@ -709,6 +764,9 @@ impl Window {
                 if self.watching && self.scan_generation == generation {
                     match result {
                         Ok(reading) => {
+                            if let (Some(job), Some(player)) = (&self.discovery, &reading.player) {
+                                job.observe(player.clone());
+                            }
                             refreshed |= self.capture_error.take().is_some()
                                 || self.reading.stats != reading.stats;
                             if refreshed && !reading.stats.is_empty() {
@@ -907,6 +965,12 @@ fn draw_button(item: &DRAWITEMSTRUCT) {
     }
 }
 
+fn set_font(hwnd: HWND, font: HFONT) {
+    if !hwnd.is_null() && unsafe { SendMessageW(hwnd, WM_GETFONT, 0, 0) } as HFONT != font {
+        unsafe { SendMessageW(hwnd, WM_SETFONT, font as usize, 1) };
+    }
+}
+
 fn draw_stat_card(item: &DRAWITEMSTRUCT) {
     unsafe {
         let brush = CreateSolidBrush(SECONDARY);
@@ -1076,6 +1140,8 @@ fn run() -> std::io::Result<()> {
             settings,
             panel: Panel::Main,
             children: Vec::new(),
+            render_cursor: 0,
+            rendered_height: 0,
             dpi,
             font: Font::new(dpi, 15, 400),
             heading_font: Font::new(dpi, 20, 600),

@@ -1,5 +1,5 @@
 use image::{RgbaImage, imageops::FilterType};
-use std::{io, ptr::null_mut, slice};
+use std::{io, ptr::null_mut, slice, time::Instant};
 use windows::{
     Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
     Media::Ocr::{OcrEngine, OcrResult},
@@ -22,6 +22,16 @@ use windows_sys::Win32::{
 #[derive(Default)]
 pub struct Reading {
     pub stats: Vec<String>,
+    pub player: Option<Player>,
+}
+
+#[derive(Clone)]
+pub struct Player {
+    pub name: String,
+    pub level: u32,
+    pub health: f32,
+    pub damage: f32,
+    pub captured: Instant,
 }
 
 impl Reading {
@@ -71,18 +81,16 @@ pub fn read_ocr(pid: u32) -> Result<Reading, String> {
     let _apartment = Apartment::enter().map_err(|error| error.to_string())?;
     let engine =
         OcrEngine::TryCreateFromUserProfileLanguages().map_err(|error| error.to_string())?;
-    let stats = read_stat_panels(&engine, frame).map_err(|error| error.to_string())?;
-    Ok(Reading { stats })
+    let captured = Instant::now();
+    let image = RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.pixels)
+        .ok_or("Game capture has invalid image dimensions.")?;
+    let stats = read_stat_panels(&engine, &image).map_err(|error| error.to_string())?;
+    let player = read_player(&engine, &image, &stats, captured);
+    Ok(Reading { stats, player })
 }
 
-fn read_stat_panels(engine: &OcrEngine, frame: Frame) -> windows::core::Result<Vec<String>> {
-    let Frame {
-        pixels,
-        width,
-        height,
-    } = frame;
-    let image = RgbaImage::from_raw(width as u32, height as u32, pixels)
-        .expect("capture returns a packed 32-bit image");
+fn read_stat_panels(engine: &OcrEngine, image: &RgbaImage) -> windows::core::Result<Vec<String>> {
+    let (width, height) = image.dimensions();
     let max_dimension = OcrEngine::MaxImageDimension()?;
     let mut text = String::new();
     for [left, top, right, bottom] in STAT_PANELS {
@@ -90,7 +98,10 @@ fn read_stat_panels(engine: &OcrEngine, frame: Frame) -> windows::core::Result<V
         let y = (top * height as f32) as u32;
         let w = (right * 2.0 * width as f32) as u32 - x;
         let h = (bottom * height as f32) as u32 - y;
-        let panel = image::imageops::crop_imm(&image, x, y, w, h).to_image();
+        if w == 0 || h == 0 {
+            continue;
+        }
+        let panel = image::imageops::crop_imm(image, x, y, w, h).to_image();
         let scale = (max_dimension / w.max(h)).clamp(1, 3);
         let enlarged = image::imageops::resize(&panel, w * scale, h * scale, FilterType::Lanczos3);
         // Lanczos filters each channel independently. The captured pixels remain BGRA.
@@ -106,12 +117,116 @@ fn read_stat_panels(engine: &OcrEngine, frame: Frame) -> windows::core::Result<V
     if !stats.is_empty() {
         return Ok(stats);
     }
-    let result = recognize(engine, image.as_raw(), width, height)?;
+    let result = recognize(engine, image.as_raw(), width as usize, height as usize)?;
     let mut stats = stats_from_text(&stat_rows(&result)?);
     if stats.len() < 2 {
         stats.clear();
     }
     Ok(stats)
+}
+
+fn read_player(
+    engine: &OcrEngine,
+    image: &RgbaImage,
+    stats: &[String],
+    captured: Instant,
+) -> Option<Player> {
+    let health = stats
+        .iter()
+        .find_map(|stat| stat.strip_prefix("HP "))?
+        .replace(',', "")
+        .parse::<f32>()
+        .ok()?;
+    let damage = stats
+        .iter()
+        .find_map(|stat| stat.strip_prefix("Damage "))?
+        .strip_suffix('%')?
+        .parse::<f32>()
+        .ok()?;
+    let read = |bounds| read_crop(engine, image, bounds);
+    let header = read([0.047, 0.131, 0.218, 0.197])?;
+    let (sheet_name, level) = character_header(&header)?;
+    // The player frame has a clean name even when buff icons overlap the character sheet.
+    let player_frame = read([0.065, 0.029, 0.135, 0.054]);
+    let name = player_frame
+        .as_deref()
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .find(|line| character_name(line))
+        })
+        .or(sheet_name)?;
+    Some(Player {
+        name: name.to_owned(),
+        level,
+        health,
+        damage: 1.0 + damage / 100.0,
+        captured,
+    })
+}
+
+fn read_crop(engine: &OcrEngine, image: &RgbaImage, bounds: [f32; 4]) -> Option<String> {
+    let [left, top, right, bottom] = bounds;
+    let x = (left * image.width() as f32) as u32;
+    let y = (top * image.height() as f32) as u32;
+    let width = (right * image.width() as f32) as u32 - x;
+    let height = (bottom * image.height() as f32) as u32 - y;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let scale = (OcrEngine::MaxImageDimension().ok()? / width.max(height)).clamp(1, 3);
+    let crop = image::imageops::crop_imm(image, x, y, width, height).to_image();
+    let crop = image::imageops::resize(&crop, width * scale, height * scale, FilterType::Lanczos3);
+    let result = recognize(
+        engine,
+        crop.as_raw(),
+        crop.width() as usize,
+        crop.height() as usize,
+    )
+    .ok()?;
+    stat_rows(&result).ok()
+}
+
+fn character_name(name: &str) -> bool {
+    (2..=24).contains(&name.len())
+        && name.chars().next().is_some_and(char::is_alphabetic)
+        && name
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '\'' | '-' | '_' | ' '))
+}
+
+fn character_header(text: &str) -> Option<(Option<&str>, u32)> {
+    let mut name = None;
+    for line in text.lines().map(str::trim) {
+        let mut words = line.split_whitespace();
+        if words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("level"))
+        {
+            let level = words.next()?.parse().ok()?;
+            return (1..=10_000).contains(&level).then_some((name, level));
+        }
+        if character_name(line) {
+            name = Some(line);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::character_header;
+
+    #[test]
+    fn character_header_requires_a_valid_game_level() {
+        assert_eq!(
+            character_header("Hero \nLevel 18 Orc Shaman"),
+            Some((Some("Hero"), 18))
+        );
+        assert_eq!(character_header("Level 20 Orc Shaman"), Some((None, 20)));
+        assert!(character_header("Run Stats\nHealth 839").is_none());
+        assert!(character_header("Hero\nLevel 0").is_none());
+    }
 }
 
 fn recognize(

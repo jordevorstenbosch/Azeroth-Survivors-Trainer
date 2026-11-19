@@ -1,9 +1,9 @@
-use crate::game;
+use crate::{game, hud};
 use std::{
     io,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
@@ -75,15 +75,12 @@ pub const TARGETS: [Target; 4] = [
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub build: String,
-    pub candidates: usize,
-    pub unreadable_chunks: usize,
     pub freezing: bool,
-    pub awaiting_progress: bool,
-    matching: Vec<(usize, usize)>,
 }
 
 pub struct Job {
     cancel: Arc<AtomicBool>,
+    observation: Arc<Mutex<Option<hud::Player>>>,
     pub result: Receiver<io::Result<Report>>,
 }
 
@@ -91,10 +88,14 @@ impl Job {
     pub fn start(
         path: PathBuf,
         instance: game::ProcessInstance,
-        solo_character: Option<String>,
+        character: String,
+        observed: Option<hud::Player>,
+        named_override: bool,
     ) -> io::Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let observation = Arc::new(Mutex::new(observed));
+        let worker_observation = Arc::clone(&observation);
         let (sender, result) = mpsc::channel();
         thread::Builder::new()
             .name("stat-discovery".into())
@@ -103,32 +104,46 @@ impl Job {
                     let memory = Memory::open(instance, false)?;
                     let build = game::build_id(&path)?;
                     check_cancel(&worker_cancel)?;
-                    let character = solo_character
-                        .as_deref()
-                        .filter(|_| build == VERIFIED_BUILD);
-                    let mut report = memory.scan(build, character, &worker_cancel)?;
-                    if let Some(character) = character {
-                        report.awaiting_progress = true;
-                        let candidates = std::mem::take(&mut report.matching);
-                        let _ = sender.send(Ok(report.clone()));
-                        let actor =
-                            memory.wait_for_progress(&candidates, character, &worker_cancel)?;
-                        let writer = Memory::open(instance, true)?;
-                        writer.freeze(actor, character, &worker_cancel, || {
-                            report.awaiting_progress = false;
-                            report.freezing = true;
-                            let _ = sender.send(Ok(report.clone()));
-                        })?;
-                    } else {
-                        let _ = sender.send(Ok(report));
+                    if build != VERIFIED_BUILD {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            format!("Freezing is unavailable for game build {}.", &build[..12]),
+                        ));
                     }
+                    let _ = sender.send(Ok(Report {
+                        build: build.clone(),
+                        freezing: false,
+                    }));
+                    let candidates = memory.scan(&character, &worker_cancel)?;
+                    let actor = memory.verify_actor(
+                        &candidates,
+                        &character,
+                        &worker_observation,
+                        named_override,
+                        &worker_cancel,
+                    )?;
+                    let writer = Memory::open(instance, true)?;
+                    writer.freeze(actor, &character, &worker_cancel, || {
+                        let _ = sender.send(Ok(Report {
+                            build,
+                            freezing: true,
+                        }));
+                    })?;
                     Ok::<(), io::Error>(())
                 };
                 if let Err(error) = work() {
                     let _ = sender.send(Err(error));
                 }
             })?;
-        Ok(Self { cancel, result })
+        Ok(Self {
+            cancel,
+            observation,
+            result,
+        })
+    }
+
+    pub fn observe(&self, player: hud::Player) {
+        *self.observation.lock().unwrap() = Some(player);
     }
 }
 
@@ -145,6 +160,8 @@ struct Actor {
     base: usize,
     header: usize,
     level: u32,
+    health: f32,
+    damage: f32,
 }
 
 impl Memory {
@@ -202,6 +219,11 @@ impl Memory {
                 .try_into()
                 .unwrap(),
         );
+        let damage = f32::from_le_bytes(
+            bytes[LEVEL_DISTANCE + 4..LEVEL_DISTANCE + 8]
+                .try_into()
+                .unwrap(),
+        );
         if !(1..=10_000).contains(&level) || !(50.0..=1e6).contains(&hp) {
             return Err(io::Error::other("Character level or health is invalid."));
         }
@@ -209,13 +231,17 @@ impl Memory {
             base,
             header,
             level,
+            health: hp,
+            damage,
         })
     }
 
-    fn wait_for_progress(
+    fn verify_actor(
         &self,
         candidates: &[(usize, usize)],
         character: &str,
+        observation: &Mutex<Option<hud::Player>>,
+        named_override: bool,
         cancel: &AtomicBool,
     ) -> io::Result<Actor> {
         let initial: Vec<_> = candidates
@@ -233,8 +259,20 @@ impl Memory {
             check_cancel(cancel)?;
             let current = initial
                 .iter()
-                .filter_map(|actor| self.actor(actor.base, actor.header, character).ok());
-            let advancing = unique_progress(&initial, current);
+                .filter_map(|actor| self.actor(actor.base, actor.header, character).ok())
+                .collect::<Vec<_>>();
+            if let Some(actor) = observation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|player| player.name.eq_ignore_ascii_case(character))
+                .and_then(|player| unique_panel_match(&current, player))
+            {
+                return Ok(actor);
+            }
+            let advancing = named_override
+                .then(|| unique_progress(&initial, current.into_iter()))
+                .flatten();
             if let Some(actor) = advancing {
                 if last == Some(actor.base) {
                     return Ok(actor);
@@ -244,7 +282,7 @@ impl Memory {
             thread::sleep(POLL_INTERVAL);
         }
         Err(io::Error::other(
-            "Waiting for a unique solo character to level up.",
+            "Keep the character panel open while the watcher verifies the live record.",
         ))
     }
 
@@ -303,20 +341,8 @@ impl Memory {
         Ok(())
     }
 
-    fn scan(
-        &self,
-        build: String,
-        character: Option<&str>,
-        cancel: &AtomicBool,
-    ) -> io::Result<Report> {
-        let mut report = Report {
-            build,
-            candidates: 0,
-            unreadable_chunks: 0,
-            freezing: false,
-            awaiting_progress: false,
-            matching: Vec::new(),
-        };
+    fn scan(&self, character: &str, cancel: &AtomicBool) -> io::Result<Vec<(usize, usize)>> {
+        let mut matching = Vec::new();
         let mut next = 0;
         let mut buffer = vec![0; CHUNK + NAME_REACH + LEVEL_DISTANCE + 4];
         loop {
@@ -335,7 +361,7 @@ impl Memory {
                 // ERROR_INVALID_PARAMETER marks the end of user-mode addresses.
                 return if next != 0 && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
                 {
-                    Ok(report)
+                    Ok(matching)
                 } else {
                     Err(error)
                 };
@@ -359,34 +385,41 @@ impl Memory {
                 let to = last.saturating_add(LEVEL_DISTANCE + 4).min(end);
                 let bytes = &mut buffer[..to - from];
                 if self.read(from, bytes).is_err() {
-                    report.unreadable_chunks += 1;
                     continue;
                 }
                 for offset in candidate_offsets(bytes, cursor - from, last - from) {
                     check_cancel(cancel)?;
-                    let mut plausible = false;
                     for (header, pointer, length) in name_headers(&bytes[..offset]) {
-                        let mut buffer = [0; 24];
-                        let name = &mut buffer[..length];
-                        if self.read(pointer, name).is_err() || !plausible_name(name) {
+                        if length != character.len() {
                             continue;
                         }
-                        plausible = true;
-                        if character
-                            .is_some_and(|expected| name.eq_ignore_ascii_case(expected.as_bytes()))
-                        {
-                            report.matching.push((from + offset, from + header));
-                            break;
+                        let mut buffer = [0; 24];
+                        let name = &mut buffer[..length];
+                        if self.read(pointer, name).is_err() {
+                            continue;
                         }
-                        if character.is_none() {
+                        if name.eq_ignore_ascii_case(character.as_bytes()) {
+                            matching.push((from + offset, from + header));
                             break;
                         }
                     }
-                    report.candidates += usize::from(plausible);
                 }
             }
         }
     }
+}
+
+fn unique_panel_match(actors: &[Actor], player: &hud::Player) -> Option<Actor> {
+    if player.captured.elapsed() > Duration::from_secs(5) {
+        return None;
+    }
+    let mut matches = actors.iter().copied().filter(|actor| {
+        actor.level == player.level
+            && (actor.health - player.health).abs() <= 1.1
+            && (actor.damage - player.damage).abs() <= 0.0051
+    });
+    let actor = matches.next()?;
+    matches.next().is_none().then_some(actor)
 }
 
 impl Drop for Memory {
@@ -468,14 +501,6 @@ fn parse_name_header(header: &[u8]) -> Option<(usize, usize)> {
     .then_some((pointer as usize, length as usize))
 }
 
-fn plausible_name(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|name| {
-        let mut chars = name.chars();
-        chars.next().is_some_and(char::is_alphabetic)
-            && chars.all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\'' | ' ' | '-'))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_shifted_text_headers_and_rejects_non_names() {
+    fn accepts_shifted_text_headers() {
         let mut bytes = [0_u8; 1600];
         let offset = 496;
         bytes[offset..offset + 8].copy_from_slice(&8_u64.to_le_bytes());
@@ -520,8 +545,6 @@ mod tests {
             name_headers(&bytes).collect::<Vec<_>>(),
             [(offset, 0x20000, 4)]
         );
-        assert!(plausible_name(b"Hero"));
-        assert!(!plausible_name(b" 42%"));
     }
 
     #[test]
@@ -564,11 +587,15 @@ mod tests {
             base: 1000,
             header: 200,
             level: 1,
+            health: 200.0,
+            damage: 1.9,
         };
         let live = Actor {
             base: 2000,
             header: 1200,
             level: 20,
+            health: 839.3,
+            damage: 3.34,
         };
         let initial = [stale, live];
         assert!(unique_progress(&initial, initial.into_iter()).is_none());
@@ -581,5 +608,38 @@ mod tests {
 
         let duplicate = Actor { level: 2, ..stale };
         assert!(unique_progress(&initial, [duplicate, next].into_iter()).is_none());
+    }
+
+    #[test]
+    fn starts_freezing_when_one_record_matches_the_current_panel() {
+        let player = hud::Player {
+            name: "Hero".into(),
+            level: 20,
+            health: 839.0,
+            damage: 3.34,
+            captured: Instant::now(),
+        };
+        let live = Actor {
+            base: 2000,
+            header: 1200,
+            level: 20,
+            health: 839.3,
+            damage: 3.338,
+        };
+        let stale = Actor {
+            base: 3000,
+            level: 1,
+            ..live
+        };
+        assert_eq!(
+            unique_panel_match(&[stale, live], &player).map(|actor| actor.base),
+            Some(live.base)
+        );
+        assert!(unique_panel_match(&[Actor { base: 4000, ..live }, live], &player).is_none());
+        let old = hud::Player {
+            captured: Instant::now() - Duration::from_secs(6),
+            ..player
+        };
+        assert!(unique_panel_match(&[live], &old).is_none());
     }
 }
