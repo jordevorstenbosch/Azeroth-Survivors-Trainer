@@ -1,7 +1,7 @@
 use std::{io, ptr::null_mut, slice};
 use windows::{
     Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
-    Media::Ocr::OcrEngine,
+    Media::Ocr::{OcrEngine, OcrResult},
     Storage::Streams::DataWriter,
     Win32::{
         Foundation::HWND as AutomationHwnd,
@@ -127,8 +127,9 @@ fn read_ocr(pid: u32) -> Result<Reading, String> {
     let engine =
         OcrEngine::TryCreateFromUserProfileLanguages().map_err(|error| error.to_string())?;
     let name = read_name(&engine, &frame);
-    let text = recognize(&engine, &frame.pixels, frame.width, frame.height)
+    let result = recognize(&engine, &frame.pixels, frame.width, frame.height)
         .map_err(|error| error.to_string())?;
+    let text = stat_rows(&result).map_err(|error| error.to_string())?;
     Ok(Reading {
         name,
         stats: stats_from_text(&text),
@@ -150,7 +151,14 @@ fn read_name(engine: &OcrEngine, frame: &Frame) -> Option<String> {
             pixels.extend_from_slice(&frame.pixels[index..index + 4]);
         }
     }
-    let text = recognize(engine, &pixels, width, height).ok()?;
+    let lines = recognize(engine, &pixels, width, height)
+        .ok()?
+        .Lines()
+        .ok()?;
+    if lines.Size().ok()? != 1 {
+        return None;
+    }
+    let text = lines.GetAt(0).ok()?.Text().ok()?.to_string_lossy();
     let candidate = text.trim();
     let mut chars = candidate.chars();
     (candidate.len() <= 24
@@ -165,7 +173,7 @@ fn recognize(
     pixels: &[u8],
     width: usize,
     height: usize,
-) -> windows::core::Result<String> {
+) -> windows::core::Result<OcrResult> {
     let writer = DataWriter::new()?;
     writer.WriteBytes(pixels)?;
     let buffer = writer.DetachBuffer()?;
@@ -176,12 +184,45 @@ fn recognize(
         BitmapAlphaMode::Ignore,
     )?;
     bitmap.CopyFromBuffer(&buffer)?;
-    let result = engine.RecognizeAsync(&bitmap)?.get()?;
+    engine.RecognizeAsync(&bitmap)?.get()
+}
+
+fn stat_rows(result: &OcrResult) -> windows::core::Result<String> {
+    struct Word {
+        x: f32,
+        center: f32,
+        height: f32,
+        text: String,
+    }
     let lines = result.Lines()?;
-    let mut text = String::new();
+    let mut words = Vec::new();
     for index in 0..lines.Size()? {
-        text.push_str(&lines.GetAt(index)?.Text()?.to_string_lossy());
+        let line = lines.GetAt(index)?.Words()?;
+        for index in 0..line.Size()? {
+            let word = line.GetAt(index)?;
+            let bounds = word.BoundingRect()?;
+            words.push(Word {
+                x: bounds.X,
+                center: bounds.Y + bounds.Height / 2.0,
+                height: bounds.Height,
+                text: word.Text()?.to_string_lossy(),
+            });
+        }
+    }
+    words.sort_by(|a, b| a.center.total_cmp(&b.center));
+    let mut text = String::new();
+    let mut remaining = words.as_mut_slice();
+    while let Some(first) = remaining.first() {
+        let end = remaining
+            .partition_point(|word| word.center - first.center <= (first.height * 0.5).max(3.0));
+        let (row, rest) = remaining.split_at_mut(end);
+        row.sort_by(|a, b| a.x.total_cmp(&b.x));
+        for word in row {
+            text.push_str(&word.text);
+            text.push(' ');
+        }
         text.push('\n');
+        remaining = rest;
     }
     Ok(text)
 }
@@ -204,20 +245,7 @@ fn stats_from_text(text: &str) -> Vec<String> {
     ];
     let mut values = Vec::new();
     for label in labels {
-        let mut matches = text.lines().filter_map(|line| {
-            let (field, value) = line.trim().split_once(':')?;
-            if !field.trim().eq_ignore_ascii_case(label) {
-                return None;
-            }
-            let displayed = value.split_whitespace().next()?;
-            if label == "Health" {
-                let normalized = displayed.replace(',', "");
-                let number = normalized.parse::<u32>().ok()?;
-                return (number > 0).then(|| format!("HP {displayed}"));
-            }
-            let number = displayed.strip_suffix('%')?.parse::<f32>().ok()?;
-            (number.is_finite() && number >= 0.0).then(|| format!("{label} {displayed}"))
-        });
+        let mut matches = text.lines().filter_map(|line| stat_on_row(line, label));
         if let Some(value) = matches.next() {
             if matches.next().is_none() {
                 values.push(value);
@@ -228,6 +256,40 @@ fn stats_from_text(text: &str) -> Vec<String> {
         values.clear();
     }
     values
+}
+
+fn stat_on_row(row: &str, label: &str) -> Option<String> {
+    let normalized = row.replace(':', " ");
+    let words: Vec<_> = normalized.split_whitespace().collect();
+    let label_words: Vec<_> = label.split_whitespace().collect();
+    for (offset, candidate) in words.windows(label_words.len()).enumerate() {
+        if !candidate
+            .iter()
+            .zip(&label_words)
+            .all(|(word, expected)| word.eq_ignore_ascii_case(expected))
+        {
+            continue;
+        }
+        let index = offset + label_words.len();
+        let displayed = words.get(index)?;
+        if label == "Health" {
+            let value = displayed.replace(',', "").parse::<u32>().ok()?;
+            return (value > 0).then(|| format!("HP {displayed}"));
+        }
+        let (displayed, next) = if *displayed == "+" {
+            (format!("+{}", words.get(index + 1)?), index + 2)
+        } else {
+            (displayed.to_string(), index + 1)
+        };
+        let number = match displayed.strip_suffix('%') {
+            Some(number) => number,
+            None if words.get(next) == Some(&"%") => &displayed,
+            None => continue,
+        };
+        let value = number.parse::<f32>().ok()?;
+        return (value.is_finite() && value >= 0.0).then(|| format!("{label} {number}%"));
+    }
+    None
 }
 
 fn game_window(pid: u32) -> HWND {
