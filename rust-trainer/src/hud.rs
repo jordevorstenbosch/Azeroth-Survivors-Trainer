@@ -76,7 +76,7 @@ impl Drop for Apartment {
     }
 }
 
-pub fn read_ocr(pid: u32) -> Result<Reading, String> {
+pub fn read_ocr(pid: u32, identify_player: bool) -> Result<Reading, String> {
     let frame = capture(pid).map_err(|error| error.to_string())?;
     let _apartment = Apartment::enter().map_err(|error| error.to_string())?;
     let engine =
@@ -85,7 +85,9 @@ pub fn read_ocr(pid: u32) -> Result<Reading, String> {
     let image = RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.pixels)
         .ok_or("Game capture has invalid image dimensions.")?;
     let stats = read_stat_panels(&engine, &image).map_err(|error| error.to_string())?;
-    let player = read_player(&engine, &image, &stats, captured);
+    let player = identify_player
+        .then(|| read_player(&engine, &image, &stats, captured))
+        .flatten();
     Ok(Reading { stats, player })
 }
 
@@ -167,9 +169,11 @@ fn read_player(
 
 fn read_crop(engine: &OcrEngine, image: &RgbaImage, bounds: [f32; 4]) -> Option<String> {
     let [left, top, right, bottom] = bounds;
-    let x = (left * image.width() as f32) as u32;
+    // Capture stores the left half of the game, while bounds use the full client width.
+    let client_width = image.width() as f32 * 2.0;
+    let x = (left * client_width) as u32;
     let y = (top * image.height() as f32) as u32;
-    let width = (right * image.width() as f32) as u32 - x;
+    let width = (right * client_width) as u32 - x;
     let height = (bottom * image.height() as f32) as u32 - y;
     if width == 0 || height == 0 {
         return None;

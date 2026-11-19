@@ -788,8 +788,9 @@ impl Window {
         if self.watching && self.capture.is_none() && Instant::now() >= self.next_capture {
             if let Some(process) = self.game_instance {
                 let (sender, receiver) = mpsc::sync_channel(1);
+                let identify_player = self.discovery_phase != DiscoveryPhase::Freezing;
                 std::thread::spawn(move || {
-                    let _ = sender.send(hud::read_ocr(process.pid));
+                    let _ = sender.send(hud::read_ocr(process.pid, identify_player));
                 });
                 self.capture = Some((self.scan_generation, receiver));
                 self.next_capture = Instant::now() + Duration::from_secs(4);
