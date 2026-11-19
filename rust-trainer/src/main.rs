@@ -270,7 +270,7 @@ impl Window {
         let freezing = self.watching && self.discovery_phase == DiscoveryPhase::Freezing;
         let show_update = !self.update_message.is_empty();
         let height = match self.panel {
-            Panel::Main if freezing => 446,
+            Panel::Main if freezing => 378,
             Panel::Main => 293,
             Panel::Talents => 292,
         } + if show_update { 38 } else { 0 };
@@ -445,7 +445,10 @@ impl Window {
         } else {
             150
         };
-        self.render_character_panel(hwnd, panel_y, freezing);
+        if !freezing {
+            self.render_character_panel(hwnd, panel_y);
+        }
+        let metadata_y = if freezing { panel_y + 5 } else { panel_y + 73 };
         let build = self
             .build
             .as_deref()
@@ -454,7 +457,7 @@ impl Window {
         self.text(
             hwnd,
             &format!("Game build  {build}"),
-            [18, panel_y + 73, 264, 20],
+            [18, metadata_y, 264, 20],
             MUTED_TEXT,
         );
         if self.watching {
@@ -463,31 +466,31 @@ impl Window {
                 "STATIC",
                 "Solo mode",
                 SS_RIGHT | SS_NOPREFIX,
-                [331, panel_y + 73, 151, 20],
+                [331, metadata_y, 151, 20],
                 MUTED_TEXT,
             );
         }
     }
 
-    fn render_character_panel(&mut self, hwnd: HWND, top: i32, freezing: bool) {
+    fn render_character_panel(&mut self, hwnd: HWND, top: i32) {
         self.text(hwnd, "Character panel", [18, top, 230, 20], 0);
-        let readings: Vec<_> = self
-            .reading
-            .stats
-            .iter()
-            .filter(|reading| {
-                !freezing
-                    || !["Damage ", "Area ", "Luck ", "Gold "]
-                        .iter()
-                        .any(|label| reading.starts_with(label))
-            })
-            .take(6)
-            .cloned()
-            .collect();
+        let readings: Vec<_> = [
+            ("Damage ", "Damage"),
+            ("Area ", "Area"),
+            ("Gold ", "Gold Bonus"),
+            ("Luck ", "Luck"),
+        ]
+        .into_iter()
+        .filter_map(|(prefix, label)| {
+            self.reading
+                .stats
+                .iter()
+                .find_map(|stat| stat.strip_prefix(prefix))
+                .map(|value| format!("{label} {value}"))
+        })
+        .collect();
         if readings.is_empty() {
-            let hint = if freezing && self.reading.has_character_panel() {
-                "The visible stats are listed in Frozen targets."
-            } else if self.watching && self.running {
+            let hint = if self.watching && self.running {
                 "Press C in the game to show live readings."
             } else {
                 "Live readings appear while the watcher runs."
@@ -496,9 +499,9 @@ impl Window {
             return;
         }
         for (index, reading) in readings.iter().enumerate() {
-            let x = 18 + (index % 3) as i32 * 156;
-            let y = top + 25 + (index / 3) as i32 * 22;
-            self.text(hwnd, reading, [x, y, 152, 20], MUTED_TEXT);
+            let x = 18 + (index % 2) as i32 * 237;
+            let y = top + 25 + (index / 2) as i32 * 22;
+            self.text(hwnd, reading, [x, y, 227, 20], MUTED_TEXT);
         }
     }
 
@@ -785,12 +788,15 @@ impl Window {
                 }
             }
         }
-        if self.watching && self.capture.is_none() && Instant::now() >= self.next_capture {
+        if self.watching
+            && self.discovery_phase != DiscoveryPhase::Freezing
+            && self.capture.is_none()
+            && Instant::now() >= self.next_capture
+        {
             if let Some(process) = self.game_instance {
                 let (sender, receiver) = mpsc::sync_channel(1);
-                let identify_player = self.discovery_phase != DiscoveryPhase::Freezing;
                 std::thread::spawn(move || {
-                    let _ = sender.send(hud::read_ocr(process.pid, identify_player));
+                    let _ = sender.send(hud::read_ocr(process.pid));
                 });
                 self.capture = Some((self.scan_generation, receiver));
                 self.next_capture = Instant::now() + Duration::from_secs(4);

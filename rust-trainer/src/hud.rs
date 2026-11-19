@@ -34,24 +34,6 @@ pub struct Player {
     pub captured: Instant,
 }
 
-impl Reading {
-    pub fn has_character_panel(&self) -> bool {
-        let character_fields = [
-            "HP ", "Damage ", "Haste ", "Crit ", "Armor ", "Area ", "Echo ", "Speed ",
-        ];
-        self.stats
-            .iter()
-            .filter(|stat| {
-                character_fields
-                    .iter()
-                    .any(|prefix| stat.starts_with(*prefix))
-            })
-            .take(2)
-            .count()
-            == 2
-    }
-}
-
 // Coordinates are fractions of the full client area, as in the legacy reader.
 const STAT_PANELS: [[f32; 4]; 2] = [[0.03, 0.44, 0.25, 0.60], [0.22, 0.12, 0.37, 0.36]];
 
@@ -76,7 +58,7 @@ impl Drop for Apartment {
     }
 }
 
-pub fn read_ocr(pid: u32, identify_player: bool) -> Result<Reading, String> {
+pub fn read_ocr(pid: u32) -> Result<Reading, String> {
     let frame = capture(pid).map_err(|error| error.to_string())?;
     let _apartment = Apartment::enter().map_err(|error| error.to_string())?;
     let engine =
@@ -85,9 +67,7 @@ pub fn read_ocr(pid: u32, identify_player: bool) -> Result<Reading, String> {
     let image = RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.pixels)
         .ok_or("Game capture has invalid image dimensions.")?;
     let stats = read_stat_panels(&engine, &image).map_err(|error| error.to_string())?;
-    let player = identify_player
-        .then(|| read_player(&engine, &image, &stats, captured))
-        .flatten();
+    let player = read_player(&engine, &image, &stats, captured);
     Ok(Reading { stats, player })
 }
 
