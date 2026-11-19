@@ -29,9 +29,48 @@ const CHUNK: usize = 512 * 1024;
 const NAME_REACH: usize = 1536;
 const STAT_BYTES: usize = 32;
 const LEVEL_DISTANCE: usize = 104;
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const VERIFIED_BUILD: &str = "ba09f96a327cadc24371b9dd8d876418c8d6dde298847fab318847be8c44cc5a";
-const TARGETS: [(usize, f32); 4] = [(4, 100.99), (44, 100.99), (48, 99.99), (52, 100.99)];
+
+pub struct Target {
+    pub name: &'static str,
+    offset: usize,
+    value: f32,
+    baseline: f32,
+}
+
+impl Target {
+    pub fn displayed_bonus(&self) -> String {
+        format!("{:+.0}%", (self.value - self.baseline) * 100.0)
+    }
+}
+
+pub const TARGETS: [Target; 4] = [
+    Target {
+        name: "Damage",
+        offset: 4,
+        value: 100.99,
+        baseline: 1.0,
+    },
+    Target {
+        name: "Area",
+        offset: 44,
+        value: 100.99,
+        baseline: 1.0,
+    },
+    Target {
+        name: "Luck",
+        offset: 48,
+        value: 99.99,
+        baseline: 0.0,
+    },
+    Target {
+        name: "Gold Bonus",
+        offset: 52,
+        value: 100.99,
+        baseline: 1.0,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
@@ -227,9 +266,9 @@ impl Memory {
                 ));
             }
             actor = fresh;
-            for (offset, value) in TARGETS {
+            for target in &TARGETS {
                 check_cancel(cancel)?;
-                self.write_stat(actor.base + offset, value)?;
+                self.write_stat(actor.base + target.offset, target.value)?;
             }
             if let Some(started) = started.take() {
                 started();
@@ -442,6 +481,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn displayed_targets_match_the_game_percentage_conventions() {
+        assert_eq!(
+            TARGETS.map(|target| target.displayed_bonus()),
+            ["+9999%"; 4]
+        );
+    }
+
+    #[test]
     fn finds_a_stat_block_only_in_its_own_chunk() {
         let mut bytes = [0; 512];
         let position = 256;
@@ -495,7 +542,7 @@ mod tests {
         assert_eq!(actual, expected);
         let mut stat = 1.0_f32;
         let address = std::ptr::addr_of_mut!(stat) as usize;
-        memory.write_stat(address, TARGETS[0].1).unwrap();
+        memory.write_stat(address, TARGETS[0].value).unwrap();
         let mut readback = [0; 4];
         memory.read(address, &mut readback).unwrap();
         assert_eq!(f32::from_le_bytes(readback), 100.99);

@@ -23,19 +23,23 @@ use windows_sys::Win32::{
         Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
         Gdi::{
             CreateFontW, CreateSolidBrush, DC_BRUSH, DEFAULT_GUI_FONT as UI_FONT, DT_CENTER,
-            DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, FillRect,
-            GetStockObject, HFONT, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor,
-            TRANSPARENT,
+            DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject,
+            DrawFocusRect, DrawTextW, FillRect, GetStockObject, HFONT, SelectObject, SetBkMode,
+            SetDCBrushColor, SetTextColor, TRANSPARENT,
         },
     },
-    System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_RIGHT},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemServices::{SS_NOPREFIX, SS_OWNERDRAW, SS_RIGHT},
+    },
     UI::{
         Controls::{
             DRAWITEMSTRUCT,
             Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW},
-            ODS_DISABLED, ODS_FOCUS, ODS_SELECTED,
+            ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, ODT_STATIC,
         },
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem},
+        Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled, SetFocus},
         Shell::ShellExecuteW,
         WindowsAndMessaging::*,
     },
@@ -55,11 +59,22 @@ const STATUS_DOT: u16 = 108;
 const READY_DOT: u16 = 109;
 const DIVIDER: u16 = 110;
 const LOCATE: u16 = 111;
+const STOP: u16 = 112;
+const MUTED_TEXT: u16 = 113;
+const LIVE_TEXT: u16 = 114;
+const STAT_CARD: u16 = 115;
 const PROCESS_LOOKUP_LIMIT: u8 = 10;
-const BACKGROUND: u32 = 0x242323;
-const TEXT: u32 = 0xf7f4f4;
-const SECONDARY: u32 = 0x323030;
+const BACKGROUND: u32 = rgb(22, 23, 30);
+const TEXT: u32 = rgb(242, 241, 247);
+const MUTED: u32 = rgb(172, 175, 192);
+const SECONDARY: u32 = rgb(38, 40, 53);
+const LIVE: u32 = rgb(152, 222, 184);
+const BORDER: u32 = rgb(54, 56, 72);
 const WINDOW_STYLE: u32 = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+
+const fn rgb(red: u32, green: u32, blue: u32) -> u32 {
+    red | (green << 8) | (blue << 16)
+}
 
 fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
@@ -69,6 +84,15 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
 enum Panel {
     Main,
     Talents,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum DiscoveryPhase {
+    #[default]
+    Searching,
+    WaitingForLevel,
+    Freezing,
+    Retrying,
 }
 
 struct Window {
@@ -85,6 +109,7 @@ struct Window {
     process_lookup_misses: u8,
     build: Option<String>,
     discovery: Option<discovery::Job>,
+    discovery_phase: DiscoveryPhase,
     discovery_message: String,
     next_discovery: Instant,
     reading: hud::Reading,
@@ -192,17 +217,26 @@ impl Window {
     }
 
     fn render(&mut self, hwnd: HWND) {
+        let previous_focus = unsafe { GetFocus() };
+        let focused_id = self
+            .children
+            .contains(&previous_focus)
+            .then(|| unsafe { GetDlgCtrlID(previous_focus) });
         for child in self.children.drain(..) {
             unsafe { DestroyWindow(child) };
         }
+
+        let freezing = self.watching && self.discovery_phase == DiscoveryPhase::Freezing;
+        let show_update = !self.update_message.is_empty();
         let height = match self.panel {
-            Panel::Main => 296,
-            Panel::Talents => 449,
-        };
+            Panel::Main if freezing => 446,
+            Panel::Main => 293,
+            Panel::Talents => 292,
+        } + if show_update { 38 } else { 0 };
         let mut outer = RECT {
             left: 0,
             top: 0,
-            right: self.scaled(450),
+            right: self.scaled(500),
             bottom: self.scaled(height),
         };
         unsafe {
@@ -217,166 +251,266 @@ impl Window {
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        let configured = self.settings.game_path().is_some_and(game::valid_path);
-        let status = if !configured {
-            "Game not set up yet"
-        } else if self.watching && self.running {
-            "Discovering stats"
-        } else if self.running {
-            "Game detected"
-        } else if !self.watching {
-            "Ready to launch"
-        } else {
-            "Waiting for the game"
-        };
-        let waiting_for_panel =
-            self.watching && self.running && !self.reading.has_character_panel();
-        let description = if !self.message.is_empty() {
-            self.message.clone()
-        } else if !self.discovery_message.is_empty() {
-            self.discovery_message.clone()
-        } else if waiting_for_panel {
-            "Open the character panel (C) to see visible stats.".into()
-        } else if !configured {
-            "Locate AzerothSurvivors.exe to begin.".into()
-        } else if self.watching {
-            format!(
-                "{} values detected on the character sheet.",
-                self.reading.stats.len()
-            )
-        } else {
-            "Start the watcher to read your character sheet.".into()
-        };
-        let toggle = if !configured {
-            "Locate game"
-        } else if self.watching {
-            "Stop Watcher"
-        } else {
-            "Start Watcher"
-        };
-        self.button(
-            hwnd,
-            toggle,
-            [16, 14, 132, 32],
-            if configured { START } else { LOCATE },
-        );
-        let launch_id = if configured && !self.running {
-            PRIMARY_LAUNCH
-        } else {
-            LAUNCH
-        };
-        self.child(
-            hwnd,
-            "BUTTON",
-            "Launch Game",
-            WS_TABSTOP
-                | BS_OWNERDRAW as u32
-                | if self.running || !configured {
-                    WS_DISABLED
-                } else {
-                    0
-                },
-            [158, 14, 130, 32],
-            launch_id,
-        );
-        self.button(hwnd, "Max Talents", [311, 14, 123, 32], TALENTS);
-        self.child(hwnd, "STATIC", "", 0, [16, 58, 418, 1], DIVIDER);
-        let dot = if self.running { READY_DOT } else { STATUS_DOT };
-        self.child(hwnd, "STATIC", "●", 0, [18, 73, 20, 21], dot);
-        let heading = self.child(hwnd, "STATIC", status, 0, [43, 70, 390, 26], 0);
-        if !heading.is_null() {
-            unsafe { SendMessageW(heading, WM_SETFONT, self.heading_font.handle() as usize, 1) };
-        }
-        self.child(hwnd, "STATIC", &description, 0, [43, 98, 390, 36], 0);
-
-        if !waiting_for_panel {
-            let build = self
-                .build
-                .as_deref()
-                .map_or("—", |build| &build[..12])
-                .to_owned();
-            let mut visible = self.reading.stats.chunks(2);
-            let first = visible
-                .next()
-                .map_or_else(|| "—".into(), |row| row.join("  ·  "));
-            let second = visible
-                .next()
-                .map_or_else(String::new, |row| row.join("  ·  "));
-            let rows = [
-                ("Game build", build.as_str()),
-                ("Visible stats", &first),
-                ("", &second),
-                ("Stats applied", "0"),
-            ];
-            for (index, (label, value)) in rows.into_iter().enumerate() {
-                let top = 137 + index as i32 * 23;
-                self.child(hwnd, "STATIC", label, 0, [18, top, 171, 19], 0);
-                self.child(hwnd, "STATIC", value, 0, [201, top, 232, 19], 0);
-                self.child(hwnd, "STATIC", "", 0, [16, top + 19, 418, 1], DIVIDER);
-            }
-        }
 
         match self.panel {
-            Panel::Main => {}
-            Panel::Talents => {
-                self.child(hwnd, "STATIC", "Max Talents", 0, [18, 245, 135, 22], 0);
-                self.button(hwnd, "Back", [352, 241, 81, 27], BACK);
-                let cap = format!("Raise talent cap to {}", self.settings.talent_cap());
-                self.child(
-                    hwnd,
-                    "BUTTON",
-                    &cap,
-                    WS_DISABLED | BS_OWNERDRAW as u32,
-                    [18, 277, 165, 27],
-                    0,
-                );
-                self.child(
-                    hwnd,
-                    "BUTTON",
-                    "Restore 51",
-                    WS_DISABLED | BS_OWNERDRAW as u32,
-                    [192, 277, 95, 27],
-                    0,
-                );
-                let class = format!("Max talents for  {}", self.settings.talent_class());
-                self.child(hwnd, "STATIC", &class, 0, [18, 310, 204, 20], 0);
-                self.child(
-                    hwnd,
-                    "BUTTON",
-                    "Create save",
-                    WS_DISABLED | BS_OWNERDRAW as u32,
-                    [18, 334, 145, 25],
-                    0,
-                );
-                self.button(hwnd, "Open Saves folder", [172, 334, 145, 25], SAVES);
-                self.child(
-                    hwnd,
-                    "STATIC",
-                    "Talent changes are unavailable in this build.",
-                    0,
-                    [18, 367, 296, 20],
-                    0,
-                );
+            Panel::Main => self.render_overview(hwnd, freezing),
+            Panel::Talents => self.render_talents(hwnd),
+        }
+        self.render_footer(hwnd, height);
+        if let Some(id) = focused_id {
+            let mut control = unsafe { GetDlgItem(hwnd, id) };
+            if control.is_null() && (id == i32::from(START) || id == i32::from(STOP)) {
+                let toggle = if self.watching { STOP } else { START };
+                control = unsafe { GetDlgItem(hwnd, i32::from(toggle)) };
+            }
+            if !control.is_null() && unsafe { IsWindowEnabled(control) } != 0 {
+                unsafe { SetFocus(control) };
             }
         }
-        if !self.update_message.is_empty() {
-            let status = self.update_message.clone();
-            self.child(hwnd, "STATIC", &status, 0, [18, height - 55, 414, 23], 0);
+    }
+
+    fn text(&mut self, hwnd: HWND, label: &str, rect: [i32; 4], style_id: u16) -> HWND {
+        self.child(hwnd, "STATIC", label, SS_NOPREFIX, rect, style_id)
+    }
+
+    fn heading(&mut self, hwnd: HWND, label: &str, rect: [i32; 4]) {
+        let control = self.text(hwnd, label, rect, 0);
+        if !control.is_null() {
+            unsafe { SendMessageW(control, WM_SETFONT, self.heading_font.handle() as usize, 1) };
         }
-        let footer = height - 31;
-        self.button(hwnd, "GitHub Page", [16, footer, 104, 24], GITHUB);
+    }
+
+    fn render_overview(&mut self, hwnd: HWND, freezing: bool) {
+        let configured = self.settings.game_path().is_some_and(game::valid_path);
+        let (label, action) = if !configured {
+            ("Locate game", LOCATE)
+        } else if self.watching {
+            ("Stop watcher", STOP)
+        } else {
+            ("Start watcher", START)
+        };
+        self.button(hwnd, label, [18, 16, 148, 36], action);
+        let (launch_label, launch_action, launch_style) = if self.running {
+            ("Game running", LAUNCH, WS_DISABLED)
+        } else if configured {
+            ("Launch game", PRIMARY_LAUNCH, 0)
+        } else {
+            ("Launch game", LAUNCH, WS_DISABLED)
+        };
         self.child(
             hwnd,
             "BUTTON",
-            "Check Updates",
-            WS_TABSTOP
-                | BS_OWNERDRAW as u32
-                | if self.update_check.is_some() {
-                    WS_DISABLED
-                } else {
-                    0
-                },
-            [127, footer, 121, 24],
+            launch_label,
+            WS_TABSTOP | BS_OWNERDRAW as u32 | launch_style,
+            [176, 16, 148, 36],
+            launch_action,
+        );
+        self.button(hwnd, "Max Talents", [334, 16, 148, 36], TALENTS);
+        self.text(hwnd, "", [18, 65, 464, 1], DIVIDER);
+
+        let (status, detail) = if !configured {
+            (
+                "Locate the game",
+                "Select your AzerothSurvivors.exe to get started.",
+            )
+        } else if !self.watching {
+            ("Watcher stopped", "Start the watcher when you’re ready.")
+        } else if !self.running {
+            ("Waiting for the game", "Launch Azeroth Survivors to begin.")
+        } else {
+            match self.discovery_phase {
+                DiscoveryPhase::Searching => (
+                    "Discovering stats",
+                    "Looking for the live character record.",
+                ),
+                DiscoveryPhase::WaitingForLevel => (
+                    "Waiting for a level-up",
+                    "Level up once so the watcher can identify your solo character.",
+                ),
+                DiscoveryPhase::Freezing => (
+                    "Stats frozen",
+                    "Targets are reapplied after the game recalculates them.",
+                ),
+                DiscoveryPhase::Retrying => (
+                    "Reconnecting",
+                    "The watcher will look for the character record again.",
+                ),
+            }
+        };
+        self.text(
+            hwnd,
+            "●",
+            [20, 82, 18, 20],
+            if freezing { READY_DOT } else { STATUS_DOT },
+        );
+        self.heading(hwnd, status, [42, 76, 440, 29]);
+        let detail = if !self.message.is_empty() {
+            self.message.clone()
+        } else if !self.discovery_message.is_empty()
+            && matches!(
+                self.discovery_phase,
+                DiscoveryPhase::Searching | DiscoveryPhase::Retrying
+            )
+        {
+            self.discovery_message.clone()
+        } else {
+            detail.to_owned()
+        };
+        self.text(hwnd, &detail, [42, 108, 440, 36], MUTED_TEXT);
+
+        let panel_y = if freezing {
+            self.text(hwnd, "Frozen targets", [18, 146, 220, 20], 0);
+            let interval = format!(
+                "{} active  ·  {:.1} s interval",
+                discovery::TARGETS.len(),
+                discovery::POLL_INTERVAL.as_secs_f32()
+            );
+            self.child(
+                hwnd,
+                "STATIC",
+                &interval,
+                SS_RIGHT | SS_NOPREFIX,
+                [252, 146, 230, 20],
+                LIVE_TEXT,
+            );
+            for (index, target) in discovery::TARGETS.iter().enumerate() {
+                let x = if index % 2 == 0 { 18 } else { 255 };
+                let y = 173 + (index / 2) as i32 * 62;
+                let caption = format!("{}\n{}", target.name, target.displayed_bonus());
+                let tile = self.child(
+                    hwnd,
+                    "STATIC",
+                    &caption,
+                    SS_OWNERDRAW,
+                    [x, y, 227, 53],
+                    STAT_CARD,
+                );
+                if !tile.is_null() {
+                    unsafe {
+                        SendMessageW(tile, WM_SETFONT, self.heading_font.handle() as usize, 1)
+                    };
+                }
+            }
+            303
+        } else {
+            150
+        };
+        self.render_character_panel(hwnd, panel_y, freezing);
+        let build = self
+            .build
+            .as_deref()
+            .and_then(|value| value.get(..12))
+            .map_or_else(|| "—".to_owned(), |value| value.to_owned());
+        self.text(
+            hwnd,
+            &format!("Game build  {build}"),
+            [18, panel_y + 73, 264, 20],
+            MUTED_TEXT,
+        );
+        if self.solo_character.is_some() {
+            self.child(
+                hwnd,
+                "STATIC",
+                "Solo mode",
+                SS_RIGHT | SS_NOPREFIX,
+                [331, panel_y + 73, 151, 20],
+                MUTED_TEXT,
+            );
+        }
+    }
+
+    fn render_character_panel(&mut self, hwnd: HWND, top: i32, freezing: bool) {
+        self.text(hwnd, "Character panel", [18, top, 230, 20], 0);
+        let readings: Vec<_> = self
+            .reading
+            .stats
+            .iter()
+            .filter(|reading| {
+                !freezing
+                    || !["Damage ", "Area ", "Luck ", "Gold "]
+                        .iter()
+                        .any(|label| reading.starts_with(label))
+            })
+            .take(6)
+            .cloned()
+            .collect();
+        if readings.is_empty() {
+            let hint = if freezing && self.reading.has_character_panel() {
+                "The visible stats are listed in Frozen targets."
+            } else if self.watching && self.running {
+                "Press C in the game to show live readings."
+            } else {
+                "Live readings appear while the watcher runs."
+            };
+            self.text(hwnd, hint, [18, top + 24, 464, 23], MUTED_TEXT);
+            return;
+        }
+        for (index, reading) in readings.iter().enumerate() {
+            let x = 18 + (index % 3) as i32 * 156;
+            let y = top + 25 + (index / 3) as i32 * 22;
+            self.text(hwnd, reading, [x, y, 152, 20], MUTED_TEXT);
+        }
+    }
+
+    fn render_talents(&mut self, hwnd: HWND) {
+        self.button(hwnd, "Back to trainer", [18, 16, 148, 36], BACK);
+        self.text(hwnd, "", [18, 65, 464, 1], DIVIDER);
+        self.heading(hwnd, "Max Talents", [18, 76, 380, 28]);
+        self.text(
+            hwnd,
+            "Talent editing is unavailable in this build.",
+            [18, 109, 464, 22],
+            MUTED_TEXT,
+        );
+        let cap = format!("Raise talent cap to {}", self.settings.talent_cap());
+        let class = format!("Max talents for {}", self.settings.talent_class());
+        self.child(
+            hwnd,
+            "BUTTON",
+            &cap,
+            WS_DISABLED | BS_OWNERDRAW as u32,
+            [18, 146, 190, 30],
+            0,
+        );
+        self.child(
+            hwnd,
+            "BUTTON",
+            "Restore 51",
+            WS_DISABLED | BS_OWNERDRAW as u32,
+            [218, 146, 116, 30],
+            0,
+        );
+        self.text(hwnd, &class, [18, 187, 300, 22], 0);
+        self.child(
+            hwnd,
+            "BUTTON",
+            "Create save",
+            WS_DISABLED | BS_OWNERDRAW as u32,
+            [18, 212, 148, 30],
+            0,
+        );
+        self.button(hwnd, "Open Saves folder", [176, 212, 156, 30], SAVES);
+    }
+
+    fn render_footer(&mut self, hwnd: HWND, height: i32) {
+        let footer = height - 39;
+        if !self.update_message.is_empty() {
+            let status = self.update_message.clone();
+            self.text(hwnd, &status, [18, footer - 44, 464, 34], MUTED_TEXT);
+        }
+        self.text(hwnd, "", [18, footer - 8, 464, 1], DIVIDER);
+        self.button(hwnd, "GitHub", [18, footer, 76, 27], GITHUB);
+        let style = if self.update_check.is_some() {
+            WS_DISABLED
+        } else {
+            0
+        };
+        self.child(
+            hwnd,
+            "BUTTON",
+            "Check updates",
+            WS_TABSTOP | BS_OWNERDRAW as u32 | style,
+            [104, footer, 122, 27],
             CHECK_UPDATES,
         );
         let version = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -384,9 +518,9 @@ impl Window {
             hwnd,
             "STATIC",
             &version,
-            SS_RIGHT,
-            [288, footer + 3, 146, 21],
-            0,
+            SS_RIGHT | SS_NOPREFIX,
+            [334, footer + 4, 148, 21],
+            MUTED_TEXT,
         );
     }
 
@@ -473,7 +607,10 @@ impl Window {
             return false;
         };
         let update = if instance.created.is_none() {
-            Some("Waiting to verify the game process for memory discovery.".into())
+            Some((
+                DiscoveryPhase::Searching,
+                "Waiting to verify the game process.".into(),
+            ))
         } else if let Some(job) = &self.discovery {
             let report = match job.result.try_recv() {
                 Ok(report) => report,
@@ -496,23 +633,38 @@ impl Window {
                         report.candidates,
                         report.unreadable_chunks,
                     ) {
-                        (true, _, _, _) => {
-                            "Freezing Damage, Area, Luck, and Gold Bonus every 0.5 seconds.".into()
-                        }
-                        (_, true, _, _) => {
-                            "Waiting for the named solo character to level up.".into()
-                        }
-                        (_, _, 0, 0) => "Searching game memory for a stat record.".into(),
-                        (_, _, 0, _) => "Some memory could not be read. Retrying discovery.".into(),
-                        (_, _, 1, _) => {
-                            "Found a possible stat record. Local player is unverified.".into()
-                        }
-                        (_, _, count, _) => format!(
-                            "Found {count} possible stat records. Local player is unverified."
+                        (true, _, _, _) => (
+                            DiscoveryPhase::Freezing,
+                            "Freezing Damage, Area, Luck, and Gold Bonus every 0.5 seconds.".into(),
+                        ),
+                        (_, true, _, _) => (
+                            DiscoveryPhase::WaitingForLevel,
+                            "Waiting for the named solo character to level up.".into(),
+                        ),
+                        (_, _, 0, 0) => (
+                            DiscoveryPhase::Searching,
+                            "Searching game memory for a stat record.".into(),
+                        ),
+                        (_, _, 0, _) => (
+                            DiscoveryPhase::Retrying,
+                            "Some memory could not be read. Retrying discovery.".into(),
+                        ),
+                        (_, _, 1, _) => (
+                            DiscoveryPhase::Searching,
+                            "Found a possible record. Verifying the local character.".into(),
+                        ),
+                        (_, _, count, _) => (
+                            DiscoveryPhase::Searching,
+                            format!(
+                                "Found {count} possible records. Local character is unverified."
+                            ),
                         ),
                     }
                 }
-                Err(error) => format!("Memory discovery will retry. {error}"),
+                Err(error) => (
+                    DiscoveryPhase::Retrying,
+                    format!("Memory discovery will retry. {error}"),
+                ),
             })
         } else if Instant::now() >= self.next_discovery {
             match discovery::Job::start(path.to_owned(), instance, self.solo_character.clone()) {
@@ -522,16 +674,20 @@ impl Window {
                 }
                 Err(error) => {
                     self.next_discovery = Instant::now() + Duration::from_secs(3);
-                    Some(format!("Could not start memory discovery. {error}"))
+                    Some((
+                        DiscoveryPhase::Retrying,
+                        format!("Could not start memory discovery. {error}"),
+                    ))
                 }
             }
         } else {
             None
         };
-        if let Some(update) = update {
-            let changed = self.discovery_message != update;
+        if let Some((phase, update)) = update {
+            let changed = self.discovery_phase != phase || self.discovery_message != update;
             if changed {
                 self.log(&update);
+                self.discovery_phase = phase;
                 self.discovery_message = update;
             }
             return changed;
@@ -587,6 +743,7 @@ impl Window {
     fn reset_scan(&mut self) {
         self.scan_generation = self.scan_generation.wrapping_add(1);
         self.discovery = None;
+        self.discovery_phase = DiscoveryPhase::Searching;
         self.discovery_message.clear();
         self.next_discovery = Instant::now();
         self.reading = hud::Reading::default();
@@ -634,7 +791,7 @@ impl Window {
 
     fn command(&mut self, hwnd: HWND, command: u16) {
         match command {
-            START | LOCATE => {
+            START | STOP | LOCATE => {
                 if !self.settings.game_path().is_some_and(game::valid_path)
                     && !self.choose_game(hwnd)
                 {
@@ -699,16 +856,21 @@ impl Window {
 fn draw_button(item: &DRAWITEMSTRUCT) {
     unsafe {
         let disabled = item.itemState & ODS_DISABLED != 0;
-        let primary = matches!(item.CtlID as u16, LOCATE | PRIMARY_LAUNCH);
+        let primary = matches!(item.CtlID as u16, LOCATE | START);
+        let stop = item.CtlID as u16 == STOP;
         let pressed = item.itemState & ODS_SELECTED != 0;
         let fill = if disabled {
-            0x302e2e
+            rgb(31, 33, 43)
+        } else if stop && pressed {
+            rgb(116, 62, 74)
+        } else if stop {
+            rgb(139, 71, 85)
         } else if primary && pressed {
-            0x842b64
+            rgb(79, 69, 143)
         } else if primary {
-            0xaa3e83
+            rgb(97, 84, 171)
         } else if pressed {
-            0x4a4545
+            rgb(53, 56, 75)
         } else {
             SECONDARY
         };
@@ -717,7 +879,7 @@ fn draw_button(item: &DRAWITEMSTRUCT) {
         DeleteObject(brush);
         let mut label = [0u16; 128];
         let count = GetWindowTextW(item.hwndItem, label.as_mut_ptr(), label.len() as i32);
-        SetTextColor(item.hDC, if disabled { 0xaaa5a5 } else { TEXT });
+        SetTextColor(item.hDC, if disabled { MUTED } else { TEXT });
         SetBkMode(item.hDC, TRANSPARENT as i32);
         let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
         let font = if font.is_null() {
@@ -732,7 +894,7 @@ fn draw_button(item: &DRAWITEMSTRUCT) {
             label.as_ptr(),
             count,
             &mut area,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
         if item.itemState & ODS_FOCUS != 0 {
             area.left += 3;
@@ -742,6 +904,58 @@ fn draw_button(item: &DRAWITEMSTRUCT) {
             DrawFocusRect(item.hDC, &area);
         }
         SelectObject(item.hDC, previous_font);
+    }
+}
+
+fn draw_stat_card(item: &DRAWITEMSTRUCT) {
+    unsafe {
+        let brush = CreateSolidBrush(SECONDARY);
+        FillRect(item.hDC, &item.rcItem, brush);
+        DeleteObject(brush);
+
+        let mut caption = [0u16; 96];
+        let count = GetWindowTextW(item.hwndItem, caption.as_mut_ptr(), caption.len() as i32);
+        let caption = &caption[..count.max(0) as usize];
+        let Some(divider) = caption.iter().position(|&ch| ch == u16::from(b'\n')) else {
+            return;
+        };
+        let (label, value) = caption.split_at(divider);
+        let value = &value[1..];
+
+        let font = SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+        let old_font = if font.is_null() {
+            null_mut()
+        } else {
+            SelectObject(item.hDC, font.cast())
+        };
+        let scale = |pixels| pixels * (item.rcItem.bottom - item.rcItem.top) / 53;
+        let mut name_rect = item.rcItem;
+        let mut value_rect = item.rcItem;
+        name_rect.left += scale(13);
+        name_rect.right -= scale(88);
+        value_rect.left = name_rect.right;
+        value_rect.right -= scale(13);
+        let flags = DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+        SetBkMode(item.hDC, TRANSPARENT as i32);
+        SetTextColor(item.hDC, TEXT);
+        DrawTextW(
+            item.hDC,
+            label.as_ptr(),
+            label.len() as i32,
+            &mut name_rect,
+            flags | DT_END_ELLIPSIS,
+        );
+        SetTextColor(item.hDC, LIVE);
+        DrawTextW(
+            item.hDC,
+            value.as_ptr(),
+            value.len() as i32,
+            &mut value_rect,
+            flags | DT_RIGHT,
+        );
+        if !old_font.is_null() {
+            SelectObject(item.hDC, old_font);
+        }
     }
 }
 
@@ -794,15 +1008,21 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
                 return 0;
             }
             WM_DRAWITEM if l != 0 => {
-                draw_button(&*(l as *const DRAWITEMSTRUCT));
+                let item = &*(l as *const DRAWITEMSTRUCT);
+                if item.CtlType == ODT_STATIC && item.CtlID == u32::from(STAT_CARD) {
+                    draw_stat_card(item);
+                } else {
+                    draw_button(item);
+                }
                 return 1;
             }
             WM_CTLCOLORSTATIC => {
                 let color = match GetDlgCtrlID(l as HWND) as u16 {
-                    READY_DOT => 0x83ce84,
-                    STATUS_DOT => 0x35c4f5,
+                    READY_DOT | LIVE_TEXT => LIVE,
+                    STATUS_DOT => rgb(173, 158, 242),
+                    MUTED_TEXT => MUTED,
                     DIVIDER => {
-                        SetDCBrushColor(w as _, 0x474343);
+                        SetDCBrushColor(w as _, BORDER);
                         return GetStockObject(DC_BRUSH) as LRESULT;
                     }
                     _ => TEXT,
@@ -866,6 +1086,7 @@ fn run() -> std::io::Result<()> {
             process_lookup_misses: 0,
             build: None,
             discovery: None,
+            discovery_phase: DiscoveryPhase::Searching,
             discovery_message: String::new(),
             next_discovery: Instant::now(),
             reading: hud::Reading::default(),
