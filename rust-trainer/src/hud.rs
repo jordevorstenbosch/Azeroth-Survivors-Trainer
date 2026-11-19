@@ -28,7 +28,7 @@ pub struct Reading {
 #[derive(Clone)]
 pub struct Player {
     pub name: String,
-    pub level: u32,
+    pub level: Option<u32>,
     pub health: f32,
     pub damage: f32,
     pub captured: Instant,
@@ -126,8 +126,10 @@ fn read_player(
         .parse::<f32>()
         .ok()?;
     let read = |bounds| read_crop(engine, image, bounds);
-    let header = read([0.047, 0.131, 0.218, 0.197])?;
-    let (sheet_name, level) = character_header(&header)?;
+    let header = read([0.047, 0.131, 0.218, 0.197]);
+    let parsed = header.as_deref().and_then(character_header);
+    let sheet_name = parsed.and_then(|(name, _)| name);
+    let level = parsed.map(|(_, level)| level);
     // The player frame has a clean name even when buff icons overlap the character sheet.
     let player_frame = read([0.065, 0.029, 0.135, 0.054]);
     let name = player_frame
@@ -183,10 +185,11 @@ fn character_header(text: &str) -> Option<(Option<&str>, u32)> {
     let mut name = None;
     for line in text.lines().map(str::trim) {
         let mut words = line.split_whitespace();
-        if words
-            .next()
-            .is_some_and(|word| word.eq_ignore_ascii_case("level"))
-        {
+        if words.next().is_some_and(|word| {
+            ["level", "evel", "vel"]
+                .iter()
+                .any(|label| word.eq_ignore_ascii_case(label))
+        }) {
             let level = words.next()?.parse().ok()?;
             return (1..=10_000).contains(&level).then_some((name, level));
         }
@@ -208,6 +211,7 @@ mod tests {
             Some((Some("Hero"), 18))
         );
         assert_eq!(character_header("Level 20 Orc Shaman"), Some((None, 20)));
+        assert_eq!(character_header("vel 27 Orc Shaman"), Some((None, 27)));
         assert!(character_header("Run Stats\nHealth 839").is_none());
         assert!(character_header("Hero\nLevel 0").is_none());
     }

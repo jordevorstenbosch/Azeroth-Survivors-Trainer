@@ -414,7 +414,9 @@ fn unique_panel_match(actors: &[Actor], player: &hud::Player) -> Option<Actor> {
         return None;
     }
     let mut matches = actors.iter().copied().filter(|actor| {
-        actor.level == player.level
+        player
+            .level
+            .map_or(actor.level > 1, |level| actor.level == level)
             && (actor.health - player.health).abs() <= 1.1
             && (actor.damage - player.damage).abs() <= 0.0051
     });
@@ -614,7 +616,7 @@ mod tests {
     fn starts_freezing_when_one_record_matches_the_current_panel() {
         let player = hud::Player {
             name: "Hero".into(),
-            level: 20,
+            level: Some(20),
             health: 839.0,
             damage: 3.34,
             captured: Instant::now(),
