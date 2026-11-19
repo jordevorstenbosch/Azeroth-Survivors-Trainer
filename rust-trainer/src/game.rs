@@ -30,14 +30,24 @@ pub fn valid_path(path: &Path) -> bool {
 pub fn build_id(path: &Path) -> io::Result<String> {
     let mut hasher = Sha256::new();
     io::copy(&mut File::open(path)?, &mut hasher)?;
-    let digest = format!("{:x}", hasher.finalize());
-    Ok(digest[..12].to_owned())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessInstance {
     pub pid: u32,
     pub created: Option<u64>,
+}
+
+pub fn creation_time(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<u64> {
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
 pub fn running_instance(path: &Path) -> io::Result<Option<ProcessInstance>> {
@@ -87,26 +97,12 @@ fn find_process(path: &Path, require_creation_time: bool) -> io::Result<Option<P
                             matching_paths += 1;
                             let pid = entry.th32ProcessID;
                             if require_creation_time {
-                                let mut created = FILETIME::default();
-                                let mut exited = FILETIME::default();
-                                let mut kernel = FILETIME::default();
-                                let mut user = FILETIME::default();
-                                if GetProcessTimes(
-                                    handle,
-                                    &mut created,
-                                    &mut exited,
-                                    &mut kernel,
-                                    &mut user,
-                                ) == 0
-                                {
-                                    unreadable = Some(io::Error::last_os_error());
-                                } else {
-                                    let created = (u64::from(created.dwHighDateTime) << 32)
-                                        | u64::from(created.dwLowDateTime);
-                                    present = Some(ProcessInstance {
+                                match creation_time(handle) {
+                                    Ok(created) => present = Some(ProcessInstance {
                                         pid,
                                         created: Some(created),
-                                    });
+                                    }),
+                                    Err(error) => unreadable = Some(error),
                                 }
                             } else {
                                 present = Some(ProcessInstance { pid, created: None });

@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod diagnostic_log;
+mod discovery;
 mod game;
 mod hud;
 mod settings;
@@ -82,6 +83,9 @@ struct Window {
     game_instance: Option<game::ProcessInstance>,
     process_lookup_misses: u8,
     build: Option<String>,
+    discovery: Option<discovery::Job>,
+    discovery_message: String,
+    next_discovery: Instant,
     reading: hud::Reading,
     capture: Option<(u64, Receiver<Result<hud::Reading, String>>)>,
     scan_generation: u64,
@@ -215,6 +219,8 @@ impl Window {
         let configured = self.settings.game_path().is_some_and(game::valid_path);
         let status = if !configured {
             "Game not set up yet"
+        } else if self.watching && self.running {
+            "Discovering stats"
         } else if self.running {
             "Game detected"
         } else if !self.watching {
@@ -222,11 +228,13 @@ impl Window {
         } else {
             "Waiting for the game"
         };
-        let waiting_for_panel = self.watching && !self.reading.has_character_panel();
-        let description = if waiting_for_panel {
-            "Open Character Panel (Press C) and let trainer find values".into()
-        } else if !self.message.is_empty() {
+        let waiting_for_panel = self.watching && self.running && !self.reading.has_character_panel();
+        let description = if !self.message.is_empty() {
             self.message.clone()
+        } else if !self.discovery_message.is_empty() {
+            self.discovery_message.clone()
+        } else if waiting_for_panel {
+            "Open the character panel (C) to see visible stats.".into()
         } else if !configured {
             "Locate AzerothSurvivors.exe to begin.".into()
         } else if self.watching {
@@ -280,7 +288,7 @@ impl Window {
         self.child(hwnd, "STATIC", &description, 0, [43, 98, 390, 36], 0);
 
         if !waiting_for_panel {
-            let build = self.build.clone().unwrap_or_else(|| "—".into());
+            let build = self.build.as_deref().map_or("—", |build| &build[..12]);
             let mut visible = self.reading.stats.chunks(2);
             let first = visible
                 .next()
@@ -447,26 +455,67 @@ impl Window {
         };
         let mut refresh = self.set_game_instance(instance);
         refresh |= self.poll_hud();
-        if self.watching && self.running && self.build.is_none() {
-            match game::build_id(&path) {
-                Ok(build) => {
-                    self.log(&format!(
-                        "Configured game executable SHA-256 prefix: {build}"
-                    ));
-                    self.build = Some(build);
-                    refresh = true;
+        refresh |= self.poll_discovery(&path);
+        refresh
+    }
+
+    fn poll_discovery(&mut self, path: &Path) -> bool {
+        if !self.watching {
+            return false;
+        }
+        let Some(instance) = self.game_instance else {
+            return false;
+        };
+        let update = if instance.created.is_none() {
+            Some("Waiting to verify the game process for memory discovery.".into())
+        } else if let Some(job) = &self.discovery {
+            let report = match job.result.try_recv() {
+                Ok(report) => report,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    Err(std::io::Error::other("Discovery worker ended unexpectedly."))
                 }
-                Err(error) => {
-                    let message = format!("Could not identify the game build. {error}");
-                    if self.message != message {
-                        self.log(&message);
-                        self.message = message;
-                        refresh = true;
+            };
+            self.discovery = None;
+            self.next_discovery = Instant::now() + Duration::from_secs(3);
+            Some(match report {
+                Ok(report) => {
+                    if self.build.as_ref() != Some(&report.build) {
+                        self.log(&format!("Game build SHA-256: {}", report.build));
+                        self.build = Some(report.build);
+                    }
+                    match (report.candidates, report.unreadable_chunks) {
+                        (0, 0) => "Searching game memory for a stat record.".into(),
+                        (0, _) => "Some memory could not be read. Retrying discovery.".into(),
+                        (1, _) => "Found a possible stat record. Local player is unverified.".into(),
+                        (count, _) => format!("Found {count} possible stat records. Local player is unverified."),
                     }
                 }
+                Err(error) => format!("Memory discovery will retry. {error}"),
+            })
+        } else if Instant::now() >= self.next_discovery {
+            match discovery::Job::start(path.to_owned(), instance) {
+                Ok(job) => {
+                    self.discovery = Some(job);
+                    None
+                }
+                Err(error) => {
+                    self.next_discovery = Instant::now() + Duration::from_secs(3);
+                    Some(format!("Could not start memory discovery. {error}"))
+                }
             }
+        } else {
+            None
+        };
+        if let Some(update) = update {
+            let changed = self.discovery_message != update;
+            if changed {
+                self.log(&update);
+                self.discovery_message = update;
+            }
+            return changed;
         }
-        refresh
+        false
     }
 
     fn poll_hud(&mut self) -> bool {
@@ -516,6 +565,9 @@ impl Window {
 
     fn reset_scan(&mut self) {
         self.scan_generation = self.scan_generation.wrapping_add(1);
+        self.discovery = None;
+        self.discovery_message.clear();
+        self.next_discovery = Instant::now();
         self.reading = hud::Reading::default();
         self.capture_error = None;
         self.next_capture = Instant::now();
@@ -776,6 +828,9 @@ fn run() -> std::io::Result<()> {
             game_instance: None,
             process_lookup_misses: 0,
             build: None,
+            discovery: None,
+            discovery_message: String::new(),
+            next_discovery: Instant::now(),
             reading: hud::Reading::default(),
             capture: None,
             scan_generation: 0,

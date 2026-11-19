@@ -28,6 +28,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         run: rustup toolchain install 1.93.0-x86_64-pc-windows-msvc --profile minimal
+      - name: Test Rust trainer
+        run: cargo +1.93.0-x86_64-pc-windows-msvc test --locked --manifest-path rust-trainer/Cargo.toml --target-dir build/rust-ci
       - name: Build Windows executable
         run: cargo +1.93.0-x86_64-pc-windows-msvc build --locked --release --manifest-path rust-trainer/Cargo.toml --target-dir build/rust-ci
       - name: Stage executable
