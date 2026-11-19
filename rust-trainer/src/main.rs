@@ -86,6 +86,14 @@ enum DiscoveryPhase {
     Unsupported,
 }
 
+enum UpdateControl {
+    Ready,
+    Checking(Receiver<Result<update::ReleaseStatus, String>>),
+    Latest,
+    Available(update::Release),
+    Installing(update::Release, Receiver<Result<(), String>>),
+}
+
 struct Window {
     settings: Settings,
     children: Vec<Control>,
@@ -110,7 +118,7 @@ struct Window {
     next_capture: Instant,
     capture_error: Option<String>,
     message: String,
-    update_check: Option<Receiver<Result<update::ReleaseStatus, String>>>,
+    updater: UpdateControl,
     update_message: String,
 }
 
@@ -457,18 +465,20 @@ impl Window {
             self.text(hwnd, &status, [18, footer - 44, 464, 34], MUTED_TEXT);
         }
         self.text(hwnd, "", [18, footer - 8, 464, 1], DIVIDER);
-        self.button(hwnd, "GitHub", [18, footer, 76, 27], GITHUB);
-        let style = if self.update_check.is_some() {
-            WS_DISABLED
-        } else {
-            0
+        self.button(hwnd, "GitHub Page", [18, footer, 106, 27], GITHUB);
+        let (label, style) = match self.updater {
+            UpdateControl::Ready => ("Check updates", 0),
+            UpdateControl::Checking(_) => ("Checking..", WS_DISABLED),
+            UpdateControl::Latest => ("Latest already", 0),
+            UpdateControl::Available(_) => ("Download & Install", 0),
+            UpdateControl::Installing(..) => ("Installing..", WS_DISABLED),
         };
         self.child(
             hwnd,
             "BUTTON",
-            "Check updates",
+            label,
             WS_TABSTOP | BS_OWNERDRAW as u32 | style,
-            [104, footer, 122, 27],
+            [134, footer, 164, 27],
             CHECK_UPDATES,
         );
         let version = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -721,41 +731,66 @@ impl Window {
         self.next_capture = Instant::now();
     }
 
-    fn start_update_check(&mut self) {
-        if self.update_check.is_some() {
-            return;
+    fn use_update_button(&mut self) {
+        match &self.updater {
+            UpdateControl::Checking(_) | UpdateControl::Installing(..) => return,
+            UpdateControl::Available(release) => {
+                let release = release.clone();
+                let download = release.clone();
+                let mut args: Vec<_> = env::args_os().skip(1).collect();
+                if self.watching && !args.iter().any(|arg| arg == "--autostart") {
+                    args.push("--autostart".into());
+                }
+                let (sender, receiver) = mpsc::sync_channel(1);
+                std::thread::spawn(move || {
+                    let result =
+                        update::install(&download, &args).map_err(|error| error.to_string());
+                    let _ = sender.send(result);
+                });
+                self.updater = UpdateControl::Installing(release, receiver);
+            }
+            UpdateControl::Ready | UpdateControl::Latest => {
+                let (sender, receiver) = mpsc::sync_channel(1);
+                std::thread::spawn(move || {
+                    let result =
+                        update::check(env!("CARGO_PKG_VERSION")).map_err(|error| error.to_string());
+                    let _ = sender.send(result);
+                });
+                self.updater = UpdateControl::Checking(receiver);
+            }
         }
-        let (sender, receiver) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let result =
-                update::check(env!("CARGO_PKG_VERSION")).map_err(|error| error.to_string());
-            let _ = sender.send(result);
-        });
-        self.update_check = Some(receiver);
-        self.update_message = "Checking GitHub for updates…".into();
+        self.update_message.clear();
     }
 
     fn poll_update(&mut self) -> bool {
-        let Some(receiver) = &self.update_check else {
-            return false;
+        self.updater = match &self.updater {
+            UpdateControl::Checking(receiver) => match update_result(receiver) {
+                None => return false,
+                Some(Ok(update::ReleaseStatus::Latest)) => UpdateControl::Latest,
+                Some(Ok(update::ReleaseStatus::Available(release))) => {
+                    UpdateControl::Available(release)
+                }
+                Some(Err(error)) => {
+                    self.log(&format!("Update check failed: {error}"));
+                    self.update_message = "Update check failed. Try again.".into();
+                    UpdateControl::Ready
+                }
+            },
+            UpdateControl::Installing(release, receiver) => match update_result(receiver) {
+                None => return false,
+                Some(Ok(())) => {
+                    self.log("Update installed. Restarting.");
+                    unsafe { PostQuitMessage(0) };
+                    return false;
+                }
+                Some(Err(error)) => {
+                    self.log(&format!("Update installation failed: {error}"));
+                    self.update_message = "Could not install the update. See trainer.log.".into();
+                    UpdateControl::Available(release.clone())
+                }
+            },
+            _ => return false,
         };
-        let result = match receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => Err("Update worker ended.".into()),
-        };
-        self.update_check = None;
-        self.update_message = match result {
-            Ok(status) if status.newer => {
-                format!("Update available {}. See GitHub Page.", status.tag)
-            }
-            Ok(status) => format!("No newer release. Latest on GitHub is {}.", status.tag),
-            Err(error) => {
-                self.log(&format!("Update check failed: {error}"));
-                "Update check failed. Try again.".into()
-            }
-        };
-        self.log(&self.update_message);
         true
     }
 
@@ -794,11 +829,19 @@ impl Window {
                 }
             }
             GITHUB => open(hwnd, REPO),
-            CHECK_UPDATES => self.start_update_check(),
+            CHECK_UPDATES => self.use_update_button(),
             _ => return,
         }
         self.refresh_process();
         self.render(hwnd);
+    }
+}
+
+fn update_result<T>(receiver: &Receiver<Result<T, String>>) -> Option<Result<T, String>> {
+    match receiver.try_recv() {
+        Ok(result) => Some(result),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => Some(Err("Update worker ended.".into())),
     }
 }
 
@@ -997,6 +1040,15 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
                 }
                 return 0;
             }
+            WM_CLOSE => {
+                let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Window;
+                if state
+                    .as_ref()
+                    .is_some_and(|window| matches!(window.updater, UpdateControl::Installing(..)))
+                {
+                    return 0;
+                }
+            }
             WM_DESTROY => {
                 PostQuitMessage(0);
                 return 0;
@@ -1051,7 +1103,7 @@ fn run() -> std::io::Result<()> {
             capture_error: None,
             next_capture: Instant::now(),
             message: String::new(),
-            update_check: None,
+            updater: UpdateControl::Ready,
             update_message: String::new(),
         };
         let instance = GetModuleHandleW(null());
