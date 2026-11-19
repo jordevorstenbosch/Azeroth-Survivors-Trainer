@@ -79,6 +79,7 @@ struct Window {
     font: Font,
     heading_font: Font,
     watching: bool,
+    solo_character: Option<String>,
     running: bool,
     game_instance: Option<game::ProcessInstance>,
     process_lookup_misses: u8,
@@ -477,25 +478,36 @@ impl Window {
             let report = match job.result.try_recv() {
                 Ok(report) => report,
                 Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => Err(std::io::Error::other(
-                    "Discovery worker ended unexpectedly.",
-                )),
+                Err(TryRecvError::Disconnected) => {
+                    self.discovery = None;
+                    self.next_discovery = Instant::now() + Duration::from_secs(3);
+                    return false;
+                }
             };
-            self.discovery = None;
-            self.next_discovery = Instant::now() + Duration::from_secs(3);
             Some(match report {
                 Ok(report) => {
                     if self.build.as_ref() != Some(&report.build) {
                         self.log(&format!("Game build SHA-256: {}", report.build));
                         self.build = Some(report.build);
                     }
-                    match (report.candidates, report.unreadable_chunks) {
-                        (0, 0) => "Searching game memory for a stat record.".into(),
-                        (0, _) => "Some memory could not be read. Retrying discovery.".into(),
-                        (1, _) => {
+                    match (
+                        report.freezing,
+                        report.awaiting_progress,
+                        report.candidates,
+                        report.unreadable_chunks,
+                    ) {
+                        (true, _, _, _) => {
+                            "Freezing Damage, Area, Luck, and Gold Bonus every 0.5 seconds.".into()
+                        }
+                        (_, true, _, _) => {
+                            "Waiting for the named solo character to level up.".into()
+                        }
+                        (_, _, 0, 0) => "Searching game memory for a stat record.".into(),
+                        (_, _, 0, _) => "Some memory could not be read. Retrying discovery.".into(),
+                        (_, _, 1, _) => {
                             "Found a possible stat record. Local player is unverified.".into()
                         }
-                        (count, _) => format!(
+                        (_, _, count, _) => format!(
                             "Found {count} possible stat records. Local player is unverified."
                         ),
                     }
@@ -503,7 +515,7 @@ impl Window {
                 Err(error) => format!("Memory discovery will retry. {error}"),
             })
         } else if Instant::now() >= self.next_discovery {
-            match discovery::Job::start(path.to_owned(), instance) {
+            match discovery::Job::start(path.to_owned(), instance, self.solo_character.clone()) {
                 Ok(job) => {
                     self.discovery = Some(job);
                     None
@@ -822,6 +834,21 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
 
 fn run() -> std::io::Result<()> {
     let settings = Settings::load()?;
+    let solo_character = if let Some(mut args) = env::args_os().skip(1).find_map(|arg| {
+        arg.to_str()
+            .and_then(|arg| arg.strip_prefix("--solo-character="))
+            .map(str::to_owned)
+    }) {
+        args = args.trim().to_owned();
+        if !(2..=24).contains(&args.len()) {
+            return Err(std::io::Error::other(
+                "Set --solo-character to the name shown in your solo game.",
+            ));
+        }
+        Some(args)
+    } else {
+        None
+    };
     unsafe {
         SetProcessDPIAware();
         let dpi = GetDpiForSystem() as i32;
@@ -832,7 +859,8 @@ fn run() -> std::io::Result<()> {
             dpi,
             font: Font::new(dpi, 15, 400),
             heading_font: Font::new(dpi, 20, 600),
-            watching: env::args_os().any(|arg| arg == "--autostart"),
+            watching: solo_character.is_some() || env::args_os().any(|arg| arg == "--autostart"),
+            solo_character,
             running: false,
             game_instance: None,
             process_lookup_misses: 0,
