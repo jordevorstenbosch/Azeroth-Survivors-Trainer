@@ -1,3 +1,4 @@
+use image::{RgbaImage, imageops::FilterType};
 use std::{io, ptr::null_mut, slice};
 use windows::{
     Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
@@ -32,6 +33,9 @@ pub struct Reading {
 }
 
 pub const OCR_MISS_LIMIT: u8 = 10;
+
+// Coordinates are fractions of the full client area, as in the legacy reader.
+const STAT_PANELS: [[f32; 4]; 2] = [[0.03, 0.44, 0.25, 0.60], [0.22, 0.12, 0.37, 0.36]];
 
 pub struct Scan {
     pub primary_misses: u8,
@@ -114,10 +118,11 @@ fn read_accessibility(pid: u32) -> windows::core::Result<Reading> {
                 pending.push((child, false));
             }
         }
-        Ok(Reading {
-            name: None,
-            stats: stats_from_text(&text),
-        })
+        let mut stats = stats_from_text(&text);
+        if stats.len() < 2 {
+            stats.clear();
+        }
+        Ok(Reading { name: None, stats })
     }
 }
 
@@ -127,13 +132,47 @@ fn read_ocr(pid: u32) -> Result<Reading, String> {
     let engine =
         OcrEngine::TryCreateFromUserProfileLanguages().map_err(|error| error.to_string())?;
     let name = read_name(&engine, &frame);
-    let result = recognize(&engine, &frame.pixels, frame.width, frame.height)
-        .map_err(|error| error.to_string())?;
-    let text = stat_rows(&result).map_err(|error| error.to_string())?;
-    Ok(Reading {
-        name,
-        stats: stats_from_text(&text),
-    })
+    let stats = read_stat_panels(&engine, frame).map_err(|error| error.to_string())?;
+    Ok(Reading { name, stats })
+}
+
+fn read_stat_panels(engine: &OcrEngine, frame: Frame) -> windows::core::Result<Vec<String>> {
+    let Frame {
+        pixels,
+        width,
+        height,
+    } = frame;
+    let image = RgbaImage::from_raw(width as u32, height as u32, pixels)
+        .expect("capture returns a packed 32-bit image");
+    let max_dimension = OcrEngine::MaxImageDimension()?;
+    let mut text = String::new();
+    for [left, top, right, bottom] in STAT_PANELS {
+        let x = (left * 2.0 * width as f32) as u32;
+        let y = (top * height as f32) as u32;
+        let w = (right * 2.0 * width as f32) as u32 - x;
+        let h = (bottom * height as f32) as u32 - y;
+        let panel = image::imageops::crop_imm(&image, x, y, w, h).to_image();
+        let scale = (max_dimension / w.max(h)).clamp(1, 3);
+        let enlarged = image::imageops::resize(&panel, w * scale, h * scale, FilterType::Lanczos3);
+        // Lanczos filters each channel independently. The captured pixels remain BGRA.
+        let result = recognize(
+            engine,
+            enlarged.as_raw(),
+            enlarged.width() as usize,
+            enlarged.height() as usize,
+        )?;
+        text.push_str(&stat_rows(&result)?);
+    }
+    let stats = stats_from_text(&text);
+    if !stats.is_empty() {
+        return Ok(stats);
+    }
+    let result = recognize(engine, image.as_raw(), width, height)?;
+    let mut stats = stats_from_text(&stat_rows(&result)?);
+    if stats.len() < 2 {
+        stats.clear();
+    }
+    Ok(stats)
 }
 
 fn read_name(engine: &OcrEngine, frame: &Frame) -> Option<String> {
@@ -239,6 +278,7 @@ fn stats_from_text(text: &str) -> Vec<String> {
         "Echo",
         "Speed",
         "Lifesteal",
+        "Gold",
         "Experience",
         "Luck",
         "Shielded",
@@ -251,9 +291,6 @@ fn stats_from_text(text: &str) -> Vec<String> {
                 values.push(value);
             }
         }
-    }
-    if values.len() < 2 {
-        values.clear();
     }
     values
 }
