@@ -8,7 +8,7 @@ mod hud;
 mod settings;
 mod update;
 
-use settings::Settings;
+use settings::{DetectionMode, Settings};
 use std::{
     env,
     os::windows::ffi::{OsStrExt, OsStringExt},
@@ -60,6 +60,8 @@ const LOCATE: u16 = 111;
 const STOP: u16 = 112;
 const MUTED_TEXT: u16 = 113;
 const STAT_CARD: u16 = 115;
+const OPEN_SETTINGS: u16 = 116;
+const DETECTION_MODE: u16 = 117;
 const PROCESS_LOOKUP_LIMIT: u8 = 10;
 const BACKGROUND: u32 = rgb(22, 23, 30);
 const TEXT: u32 = rgb(242, 241, 247);
@@ -97,6 +99,7 @@ enum UpdateControl {
 
 struct Window {
     settings: Settings,
+    showing_settings: bool,
     children: Vec<Control>,
     render_cursor: usize,
     rendered_height: i32,
@@ -268,12 +271,15 @@ impl Window {
 
         let active_count = self.active_stats.iter().filter(|&&active| active).count() as i32;
         let rows = (active_count + 1) / 2;
-        let height = if rows == 0 { 228 } else { 254 + rows * 62 }
-            + if self.update_message.is_empty() {
-                0
-            } else {
-                38
-            };
+        let height = if self.showing_settings || rows == 0 {
+            228
+        } else {
+            254 + rows * 62
+        } + if self.update_message.is_empty() {
+            0
+        } else {
+            38
+        };
         let mut outer = RECT {
             left: 0,
             top: 0,
@@ -296,7 +302,11 @@ impl Window {
             self.rendered_height = height;
         }
 
-        self.render_overview(hwnd, rows);
+        if self.showing_settings {
+            self.render_settings(hwnd);
+        } else {
+            self.render_overview(hwnd, rows);
+        }
         self.render_footer(hwnd, height);
         for control in self.children.drain(self.render_cursor..) {
             if !control.hwnd.is_null() {
@@ -368,7 +378,11 @@ impl Window {
             match self.discovery_phase {
                 DiscoveryPhase::Searching => (
                     "Discovering stats",
-                    "Looking for the live character record.",
+                    if self.settings.detection_mode() == DetectionMode::ReadMemory {
+                        "Matching the live character to the game's stat messages."
+                    } else {
+                        "Looking for the live character record."
+                    },
                 ),
                 DiscoveryPhase::WaitingForPanel => {
                     ("Finding your character", CHARACTER_PANEL_PROMPT)
@@ -394,6 +408,7 @@ impl Window {
         let detail = if configured
             && self.watching
             && self.running
+            && self.settings.detection_mode() == DetectionMode::Ocr
             && matches!(
                 self.discovery_phase,
                 DiscoveryPhase::Searching
@@ -478,7 +493,13 @@ impl Window {
             self.text(hwnd, &status, [18, footer - 44, 464, 34], MUTED_TEXT);
         }
         self.text(hwnd, "", [18, footer - 8, 464, 1], DIVIDER);
-        self.button(hwnd, "GitHub Page", [18, footer, 106, 27], GITHUB);
+        let settings_label = if self.showing_settings {
+            "Back"
+        } else {
+            "Settings"
+        };
+        self.button(hwnd, settings_label, [18, footer, 82, 27], OPEN_SETTINGS);
+        self.button(hwnd, "GitHub Page", [110, footer, 106, 27], GITHUB);
         let (label, style) = match self.updater {
             UpdateControl::Ready => ("Check updates", 0),
             UpdateControl::Checking(_) => ("Checking..", WS_DISABLED),
@@ -491,7 +512,7 @@ impl Window {
             "BUTTON",
             label,
             WS_TABSTOP | BS_OWNERDRAW as u32 | style,
-            [134, footer, 164, 27],
+            [226, footer, 164, 27],
             CHECK_UPDATES,
         );
         let version = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -500,9 +521,38 @@ impl Window {
             "STATIC",
             &version,
             SS_RIGHT | SS_NOPREFIX,
-            [334, footer + 4, 148, 21],
+            [400, footer + 4, 82, 21],
             MUTED_TEXT,
         );
+    }
+
+    fn render_settings(&mut self, hwnd: HWND) {
+        self.heading(hwnd, "Settings", [18, 17, 464, 30]);
+        self.text(hwnd, "Detection Mode", [18, 71, 166, 24], 0);
+        let selector = self.child(
+            hwnd,
+            "COMBOBOX",
+            "",
+            WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+            [192, 67, 290, 124],
+            DETECTION_MODE,
+        );
+        if !selector.is_null() {
+            unsafe {
+                if SendMessageW(selector, CB_GETCOUNT, 0, 0) == 0 {
+                    for label in ["OCR", "Read Memory"] {
+                        SendMessageW(selector, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+                    }
+                    let selected =
+                        usize::from(self.settings.detection_mode() == DetectionMode::ReadMemory);
+                    SendMessageW(selector, CB_SETCURSEL, selected, 0);
+                }
+            }
+        }
+        if !self.message.is_empty() {
+            let message = self.message.clone();
+            self.text(hwnd, &message, [18, 117, 464, 38], MUTED_TEXT);
+        }
     }
 
     fn log(&self, message: &str) {
@@ -622,7 +672,11 @@ impl Window {
                     } else {
                         (
                             DiscoveryPhase::Searching,
-                            "Matching the live record to your character panel.".into(),
+                            if self.settings.detection_mode() == DetectionMode::ReadMemory {
+                                "Matching the live character to the game's stat messages.".into()
+                            } else {
+                                "Matching the live record to your character panel.".into()
+                            },
                         )
                     }
                 }
@@ -640,17 +694,22 @@ impl Window {
                 }
             })
         } else if Instant::now() >= self.next_discovery {
-            let name = self.solo_character.clone().or_else(|| {
-                self.reading
-                    .player
-                    .as_ref()
-                    .map(|player| player.name.clone())
-            });
-            let Some(name) = name else {
-                return self.set_discovery_status(
-                    DiscoveryPhase::WaitingForPanel,
-                    CHARACTER_PANEL_PROMPT.into(),
-                );
+            let name = if self.settings.detection_mode() == DetectionMode::Ocr {
+                let name = self.solo_character.clone().or_else(|| {
+                    self.reading
+                        .player
+                        .as_ref()
+                        .map(|player| player.name.clone())
+                });
+                if name.is_none() {
+                    return self.set_discovery_status(
+                        DiscoveryPhase::WaitingForPanel,
+                        CHARACTER_PANEL_PROMPT.into(),
+                    );
+                }
+                name
+            } else {
+                None
             };
             match discovery::Job::start(
                 path.to_owned(),
@@ -690,6 +749,9 @@ impl Window {
     }
 
     fn poll_hud(&mut self) {
+        if self.settings.detection_mode() == DetectionMode::ReadMemory {
+            return;
+        }
         if let Some((generation, receiver)) = &self.capture {
             let generation = *generation;
             let result = match receiver.try_recv() {
@@ -747,6 +809,7 @@ impl Window {
         self.discovery_message.clear();
         self.next_discovery = Instant::now();
         self.reading = hud::Reading::default();
+        self.capture = None;
         self.capture_error = None;
         self.next_capture = Instant::now();
     }
@@ -825,6 +888,30 @@ impl Window {
 
     fn command(&mut self, hwnd: HWND, command: u16) {
         match command {
+            OPEN_SETTINGS => {
+                self.showing_settings = !self.showing_settings;
+                self.message.clear();
+            }
+            DETECTION_MODE => {
+                let selector = unsafe { GetDlgItem(hwnd, i32::from(DETECTION_MODE)) };
+                let mode = match unsafe { SendMessageW(selector, CB_GETCURSEL, 0, 0) } {
+                    0 => DetectionMode::Ocr,
+                    1 => DetectionMode::ReadMemory,
+                    _ => return,
+                };
+                if mode != self.settings.detection_mode() {
+                    if let Err(error) = self.settings.set_detection_mode(mode) {
+                        self.message = format!("Could not save Detection Mode. {error}");
+                        let previous = usize::from(
+                            self.settings.detection_mode() == DetectionMode::ReadMemory,
+                        );
+                        unsafe { SendMessageW(selector, CB_SETCURSEL, previous, 0) };
+                    } else {
+                        self.message.clear();
+                        self.reset_scan();
+                    }
+                }
+            }
             START | STOP | LOCATE => {
                 if !self.settings.game_path().is_some_and(game::valid_path)
                     && !self.choose_game(hwnd)
@@ -1025,6 +1112,9 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
                 return 1;
             }
             WM_COMMAND if l != 0 => {
+                if w as u16 == DETECTION_MODE && (w >> 16) as u16 != CBN_SELCHANGE as u16 {
+                    return 0;
+                }
                 let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Window;
                 if let Some(data) = state.as_mut() {
                     // A file dialog can dispatch timer messages while this command runs.
@@ -1110,6 +1200,7 @@ fn run() -> std::io::Result<()> {
         let dpi = GetDpiForSystem() as i32;
         let mut window = Window {
             settings,
+            showing_settings: false,
             children: Vec::new(),
             render_cursor: 0,
             rendered_height: 0,

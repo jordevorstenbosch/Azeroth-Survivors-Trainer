@@ -1,7 +1,8 @@
 fn main() {
-    println!("cargo:rerun-if-changed=../assets/trainer-icon.ico");
+    const ICON: &str = "assets/trainer-icon.ico";
+    println!("cargo:rerun-if-changed={ICON}");
     winresource::WindowsResource::new()
-        .set_icon("../assets/trainer-icon.ico")
+        .set_icon(ICON)
         .set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">

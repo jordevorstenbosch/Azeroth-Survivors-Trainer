@@ -1,7 +1,10 @@
 use crate::{game, hud};
+use sha2::{Digest, Sha256};
 use std::{
-    io,
-    path::PathBuf,
+    collections::HashMap,
+    fs::File,
+    io::{self, Read, Seek},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -32,6 +35,12 @@ const TARGET_FIELD_BYTES: usize = 56;
 const LEVEL_DISTANCE: usize = 104;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const VERIFIED_BUILD: &str = "ba09f96a327cadc24371b9dd8d876418c8d6dde298847fab318847be8c44cc5a";
+const WRITER_RVA: usize = 0x5f7f01a;
+const WRITER_FILE_OFFSET: u64 = 0x5f7e41a;
+const WRITER_HASH: &str = "34ae43d72305c49c602a8194c0757a20753cf546c29d82b61d97001f50ffb50d";
+const NAME_DISTANCE: usize = 0x660 - 0x2a8;
+const STAT_PACKET: &[u8] = b"AZS\x09hp=";
+const MAX_PACKET: usize = 1024;
 
 pub struct Target {
     pub name: &'static str,
@@ -106,7 +115,7 @@ impl Job {
     pub fn start(
         path: PathBuf,
         instance: game::ProcessInstance,
-        character: String,
+        character: Option<String>,
         observed: Option<hud::Player>,
     ) -> io::Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -131,13 +140,20 @@ impl Job {
                         build: build.clone(),
                         active: ActiveStats::default(),
                     }));
-                    let candidates = memory.scan(&character, &worker_cancel)?;
-                    let (actor, active) = memory.verify_actor(
-                        &candidates,
-                        &character,
-                        &worker_observation,
-                        &worker_cancel,
-                    )?;
+                    let (actor, character, active) = if let Some(character) = character {
+                        let candidates = memory.scan(&character, &worker_cancel)?;
+                        let (actor, active) = memory.verify_actor(
+                            &candidates,
+                            &character,
+                            &worker_observation,
+                            &worker_cancel,
+                        )?;
+                        (actor, character, active)
+                    } else {
+                        memory.verify_stat_writer(instance, &path)?;
+                        let (actor, character) = memory.verify_native_actor(&worker_cancel)?;
+                        (actor, character, [true; 4])
+                    };
                     let writer = Memory::open(instance, true)?;
                     writer.freeze(
                         actor,
@@ -183,11 +199,30 @@ struct Actor {
     base: usize,
     header: usize,
     level: u32,
+    experience: u32,
     health: f32,
     stats: [f32; 4],
 }
 
 impl Memory {
+    fn verify_stat_writer(&self, instance: game::ProcessInstance, path: &Path) -> io::Result<()> {
+        let mut file = File::open(path)?;
+        file.seek(io::SeekFrom::Start(WRITER_FILE_OFFSET))?;
+        let mut expected = [0; 350];
+        file.read_exact(&mut expected)?;
+        let mut loaded = [0; 350];
+        let address = game::module_base(instance.pid, path)?
+            .checked_add(WRITER_RVA)
+            .ok_or_else(|| io::Error::other("Invalid stat writer address."))?;
+        self.read(address, &mut loaded)?;
+        if loaded != expected || format!("{:x}", Sha256::digest(expected)) != WRITER_HASH {
+            return Err(io::Error::other(
+                "The loaded stat writer did not match the verified executable.",
+            ));
+        }
+        Ok(())
+    }
+
     fn open(instance: game::ProcessInstance, writable: bool) -> io::Result<Self> {
         let mut rights = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
         if writable {
@@ -225,18 +260,32 @@ impl Memory {
     }
 
     fn actor(&self, base: usize, header: usize, character: &str) -> io::Result<Actor> {
+        let actual = self.actor_name(header)?;
+        if !actual.eq_ignore_ascii_case(character) {
+            return Err(io::Error::other("Character name changed."));
+        }
+        self.actor_stats(base, header)
+    }
+
+    fn actor_name(&self, header: usize) -> io::Result<String> {
         let mut name_header = [0; 24];
         self.read(header, &mut name_header)?;
         let (pointer, length) = parse_name_header(&name_header)
             .ok_or_else(|| io::Error::other("Character name header changed."))?;
         let mut name = [0; 24];
         self.read(pointer, &mut name[..length])?;
-        if !name[..length].eq_ignore_ascii_case(character.as_bytes()) {
-            return Err(io::Error::other("Character name changed."));
+        let name = std::str::from_utf8(&name[..length]).map_err(io::Error::other)?;
+        if name.trim().is_empty() || name.chars().any(char::is_control) {
+            return Err(io::Error::other("Invalid character name."));
         }
+        Ok(name.to_owned())
+    }
+
+    fn actor_stats(&self, base: usize, header: usize) -> io::Result<Actor> {
         let mut bytes = [0; LEVEL_DISTANCE + TARGET_FIELD_BYTES];
         self.read(base - LEVEL_DISTANCE, &mut bytes)?;
         let level = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let experience = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let hp = f32::from_le_bytes(
             bytes[LEVEL_DISTANCE..LEVEL_DISTANCE + 4]
                 .try_into()
@@ -253,6 +302,7 @@ impl Memory {
             base,
             header,
             level,
+            experience,
             health: hp,
             stats,
         })
@@ -363,8 +413,91 @@ impl Memory {
 
     fn scan(&self, character: &str, cancel: &AtomicBool) -> io::Result<Vec<(usize, usize)>> {
         let mut matching = Vec::new();
+        self.scan_chunks(cancel, |from, bytes, start, end| {
+            for offset in candidate_offsets(bytes, start, end) {
+                check_cancel(cancel)?;
+                for (header, _, length) in name_headers(&bytes[..offset]) {
+                    if length == character.len()
+                        && self
+                            .actor_name(from + header)
+                            .is_ok_and(|name| name.eq_ignore_ascii_case(character))
+                    {
+                        matching.push((from + offset, from + header));
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(matching)
+    }
+
+    fn native_snapshot(&self, cancel: &AtomicBool) -> io::Result<(Vec<Actor>, Vec<NativeStats>)> {
+        let mut actors = Vec::new();
+        let mut packets = Vec::new();
+        self.scan_chunks(cancel, |from, bytes, start, end| {
+            for offset in candidate_offsets(bytes, start, end) {
+                check_cancel(cancel)?;
+                if offset >= NAME_DISTANCE {
+                    let header = from + offset - NAME_DISTANCE;
+                    if let Ok(actor) = self.actor_stats(from + offset, header)
+                        && self.actor_name(header).is_ok()
+                    {
+                        actors.push(actor);
+                    }
+                }
+            }
+            for (offset, _) in bytes[start..end]
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'A')
+            {
+                let packet = &bytes[start + offset..];
+                if packet.starts_with(STAT_PACKET) {
+                    if let Some(stats) = native_stats(packet)
+                        && !packets.contains(&stats)
+                    {
+                        packets.push(stats);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok((actors, packets))
+    }
+
+    fn verify_native_actor(&self, cancel: &AtomicBool) -> io::Result<(Actor, String)> {
+        let deadline = Instant::now() + Duration::from_secs(35);
+        let mut previous = HashMap::new();
+        loop {
+            let (actors, packets) = self.native_snapshot(cancel)?;
+            if let Some(selected) = native_actor(&previous, &actors, &packets) {
+                let name = self.actor_name(selected.header)?;
+                let current = self.actor(selected.base, selected.header, &name)?;
+                if packets.iter().any(|packet| packet.matches(current)) {
+                    return Ok((current, name));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "Waiting for one live character to match the native stat feed. Gain experience in a solo run.",
+                ));
+            }
+            previous = actors
+                .into_iter()
+                .map(|actor| (actor.base, actor))
+                .collect();
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn scan_chunks(
+        &self,
+        cancel: &AtomicBool,
+        mut visit: impl FnMut(usize, &[u8], usize, usize) -> io::Result<()>,
+    ) -> io::Result<()> {
         let mut next = 0;
-        let mut buffer = vec![0; CHUNK + NAME_REACH + LEVEL_DISTANCE + 4];
+        let mut buffer = vec![0; CHUNK + NAME_REACH + MAX_PACKET];
         loop {
             check_cancel(cancel)?;
             let mut region = MEMORY_BASIC_INFORMATION::default();
@@ -381,7 +514,7 @@ impl Memory {
                 // ERROR_INVALID_PARAMETER marks the end of user-mode addresses.
                 return if next != 0 && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
                 {
-                    Ok(matching)
+                    Ok(())
                 } else {
                     Err(error)
                 };
@@ -402,31 +535,76 @@ impl Memory {
                 check_cancel(cancel)?;
                 let from = cursor.saturating_sub(NAME_REACH).max(start);
                 let last = cursor.saturating_add(CHUNK).min(end);
-                let to = last.saturating_add(LEVEL_DISTANCE + 4).min(end);
+                let to = last.saturating_add(MAX_PACKET).min(end);
                 let bytes = &mut buffer[..to - from];
                 if self.read(from, bytes).is_err() {
                     continue;
                 }
-                for offset in candidate_offsets(bytes, cursor - from, last - from) {
-                    check_cancel(cancel)?;
-                    for (header, pointer, length) in name_headers(&bytes[..offset]) {
-                        if length != character.len() {
-                            continue;
-                        }
-                        let mut buffer = [0; 24];
-                        let name = &mut buffer[..length];
-                        if self.read(pointer, name).is_err() {
-                            continue;
-                        }
-                        if name.eq_ignore_ascii_case(character.as_bytes()) {
-                            matching.push((from + offset, from + header));
-                            break;
-                        }
-                    }
-                }
+                visit(from, bytes, cursor - from, last - from)?;
             }
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct NativeStats {
+    health: f32,
+    stats: [f32; 4],
+}
+
+impl NativeStats {
+    fn matches(self, actor: Actor) -> bool {
+        (self.health - actor.health).abs() <= 0.51
+            && self
+                .stats
+                .into_iter()
+                .zip(actor.stats)
+                .all(|(expected, value)| (expected - value).abs() <= 0.0051)
+    }
+}
+
+fn native_stats(packet: &[u8]) -> Option<NativeStats> {
+    let payload = packet.strip_prefix(b"AZS\x09")?;
+    let payload = &payload[..payload.len().min(MAX_PACKET)];
+    let mut fields = payload.split(|&byte| byte == b';');
+    let mut read_field = |key: &str| {
+        let (label, value) = std::str::from_utf8(fields.next()?).ok()?.split_once('=')?;
+        if label != key {
+            return None;
+        }
+        let value = value.parse::<f32>().ok()?;
+        (0.0..=1e6).contains(&value).then_some(value)
+    };
+    let health = read_field("hp")?;
+    let damage = read_field("dmg")?;
+    for key in ["cd", "crit", "cm", "arm", "reg"] {
+        read_field(key)?;
+    }
+    let area = read_field("area")?;
+    for key in ["cnt", "echo", "spd", "pick", "xp"] {
+        read_field(key)?;
+    }
+    let luck = read_field("luck")?;
+    let gold = read_field("gold")?;
+    Some(NativeStats {
+        health,
+        stats: [damage, area, luck, gold],
+    })
+}
+
+fn native_actor(
+    previous: &HashMap<usize, Actor>,
+    actors: &[Actor],
+    packets: &[NativeStats],
+) -> Option<Actor> {
+    let mut live = actors.iter().copied().filter(|actor| {
+        previous.get(&actor.base).is_some_and(|old| {
+            actor.level > old.level
+                || (actor.level == old.level && actor.experience > old.experience)
+        }) && packets.iter().any(|packet| packet.matches(*actor))
+    });
+    let actor = live.next()?;
+    live.next().is_none().then_some(actor)
 }
 
 fn matched_stats(actor: Actor, player: &hud::Player) -> ActiveStats {
@@ -625,6 +803,7 @@ mod tests {
             base: 2000,
             header: 1200,
             level: 20,
+            experience: 10,
             health: 839.3,
             stats: [3.338, 1.36, 0.0, 1.31],
         };
@@ -660,6 +839,7 @@ mod tests {
             base: 2000,
             header: 1200,
             level: 20,
+            experience: 10,
             health: 839.3,
             stats: [3.338, 1.36, 0.0, 1.31],
         };
@@ -670,5 +850,46 @@ mod tests {
             ..player
         };
         assert!(unique_panel_match([live].into_iter(), &old).is_none());
+    }
+
+    #[test]
+    fn native_feed_requires_a_unique_progressing_character() {
+        let wire = b"AZS\x09hp=928;dmg=3.457;cd=0.533;crit=0.370;cm=3.82;arm=0.390;reg=8.21;area=1.358;cnt=2;echo=0.269;spd=1.577;pick=22.4;xp=1.00;luck=0.00;gold=1.31;heal=0.0;";
+        let packet = native_stats(wire).unwrap();
+        assert!(native_stats(&wire[4..]).is_none());
+        let live = Actor {
+            base: 1000,
+            header: 200,
+            level: 22,
+            experience: 70,
+            health: 928.4,
+            stats: [3.457, 1.358, 0.0, 1.31],
+        };
+        let stale = Actor { base: 2000, ..live };
+        let previous = HashMap::from([
+            (
+                live.base,
+                Actor {
+                    experience: 68,
+                    ..live
+                },
+            ),
+            (stale.base, stale),
+        ]);
+        assert_eq!(
+            native_actor(&previous, &[live, stale], &[packet])
+                .unwrap()
+                .base,
+            live.base
+        );
+        assert!(native_actor(&previous, &[live, stale], &[]).is_none());
+        let both = [
+            live,
+            Actor {
+                experience: 71,
+                ..stale
+            },
+        ];
+        assert!(native_actor(&previous, &both, &[packet]).is_none());
     }
 }

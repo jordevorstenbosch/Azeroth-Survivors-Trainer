@@ -1,15 +1,20 @@
 # Azeroth Survivors Trainer
 
-A standalone Windows x64 trainer for the original Azeroth Survivors fan game. Version 3.0.0 is written in Rust and runs from a single executable.
+A standalone Rust trainer for the original Azeroth Survivors fan game on Windows x64.
 
 ## Get started
 
 1. Download `AzerothSurvivorsTrainer.exe` from the [latest release](https://github.com/nelbin4/Azeroth-Survivors-Trainer/releases/latest).
 2. Open the trainer. On first use, choose **Locate game** and select `AzerothSurvivors.exe`.
-3. Start a solo run or a game you host, then open the character panel with **C**.
+3. Start a solo run or a game you host. With **OCR** detection, open the character panel with **C**.
 4. Press **Start watcher** if the watcher is stopped. Use **Stop watcher** or close the trainer to stop rewriting stats.
 
-Use the trainer in solo runs or games you host. Version 3.0.0 gameplay testing covered solo runs.
+Use the trainer in solo runs or games you host. Gameplay testing covered solo runs.
+
+In **Settings → Detection Mode**, choose **OCR** to use the character panel or
+**Read Memory** to match the game's native stat messages against the live player
+record. In Read Memory, gain experience in a solo run so the watcher can
+distinguish the active record from stale copies.
 
 ## Supported stats
 
@@ -20,7 +25,7 @@ Use the trainer in solo runs or games you host. Version 3.0.0 gameplay testing c
 | Luck | +9999% |
 | Gold Bonus | +9999% |
 
-The watcher matches the character panel to the live player record. It starts rewriting the first verified stat every 0.5 seconds and adds the others as they are verified. It keeps using the same record through level-ups. The game's recalculation can briefly reset a value before the next rewrite.
+The watcher starts rewriting verified stats every 0.5 seconds and keeps using the same record through level-ups. The game's recalculation can briefly reset a value before the next rewrite.
 
 ## Updates and troubleshooting
 
@@ -34,5 +39,17 @@ The [Python v2.1.3 release](https://github.com/nelbin4/Azeroth-Survivors-Trainer
 ## Development
 
 The [Build Rust trainer workflow](.github/workflows/build-rust-trainer.yml) runs the Rust tests and builds the Windows x64 executable. Each release uses the successful workflow artifact from its release commit.
+
+### Project layout
+
+| Path | Contents |
+| --- | --- |
+| `src/` | Rust GUI, game discovery, stat watcher, settings, and updater |
+| `assets/` | Trainer icons |
+| `docs/legacy/` | [Historical trainer research](docs/legacy/TECHNICAL_NOTES.md) |
+| `releases/` | Local Windows executable and archived builds |
+| `local/` | Local tools, research, and legacy data |
+
+Cargo reads `Cargo.toml`, `Cargo.lock`, and `build.rs` at the repository root. Git ignores `releases/` and `local/`.
 
 This is an unofficial fan tool. See the [MIT license](LICENSE).

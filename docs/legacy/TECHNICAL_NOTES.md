@@ -1,6 +1,6 @@
 # Azeroth Survivors Trainer — technical notes
 
-Research log and operating notes written while building the trainer. Some sections describe historical approaches that were removed (process pausing, debugger helpers). The top-level [README](../README.md) is the user guide.
+Historical research and operating notes from the Python trainer. For the current Rust trainer, see the [README](../../README.md).
 
 ## Experimental writer-based discovery (2 November 2026)
 
@@ -8,7 +8,7 @@ Research log and operating notes written while building the trainer. Some sectio
 
 In one newly started process, a single observed candidate tracked health and damage across level-ups. A subsequent read matched the character sheet at 853 maximum health, +213% Damage, and +88% Area. This demonstrates discovery for that process and build, not robust ownership identification. Multiple copies can have the same name and values; a UI match alone does not prove the record controls gameplay. Addresses must not be reused after a run or process change. Before automatic writes, repeat this experiment across process restarts, run changes and multiple actors, establish a reliable local-player ownership check, and verify gameplay effects. Unknown builds and instruction mismatches must fail closed.
 
-# Current CLI guide
+# Legacy Python CLI guide
 
 
 
@@ -16,7 +16,7 @@ Updated 30 October 2026, Asia/Shanghai. Workspace: `<project folder>`.
 
 
 
-The supported workflow uses Python and PyMemoryEditor against the native Windows game. It identifies the character by name and ownership, then applies supported changed values without pausing the game, attaching a debugger, or replacing the modifier array. Squalr is not used.
+The 2.x workflow used Python and PyMemoryEditor with the native Windows game. It identified the character by name and ownership, then applied supported changed values without pausing the game, attaching a debugger, or replacing the modifier array.
 
 
 

@@ -18,6 +18,9 @@ _ocr_server.ps1
 .update_backup/
 *.new
 build/
+/target/
+/local/
+/releases/
 dist/
 release/
 *.spec

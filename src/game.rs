@@ -9,7 +9,8 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_NO_MORE_FILES, FILETIME, INVALID_HANDLE_VALUE},
     System::{
         Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW,
+            PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPMODULE,
             TH32CS_SNAPPROCESS,
         },
         Threading::{
@@ -31,6 +32,34 @@ pub fn build_id(path: &Path) -> io::Result<String> {
     let mut hasher = Sha256::new();
     io::copy(&mut File::open(path)?, &mut hasher)?;
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn module_base(pid: u32, path: &Path) -> io::Result<usize> {
+    let expected = path.to_string_lossy();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let mut entry: MODULEENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
+        let mut found = None;
+        let mut next = Module32FirstW(snapshot, &mut entry);
+        while next != 0 {
+            let end = entry
+                .szExePath
+                .iter()
+                .position(|&ch| ch == 0)
+                .unwrap_or(entry.szExePath.len());
+            if String::from_utf16_lossy(&entry.szExePath[..end]).eq_ignore_ascii_case(&expected) {
+                found = Some(entry.modBaseAddr as usize);
+                break;
+            }
+            next = Module32NextW(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+        found.ok_or_else(|| io::Error::other("Could not locate the loaded game executable."))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

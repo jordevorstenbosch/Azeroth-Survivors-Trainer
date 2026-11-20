@@ -4,6 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DetectionMode {
+    #[default]
+    Ocr,
+    ReadMemory,
+}
+
 pub struct Settings {
     pub directory: PathBuf,
     fields: Value,
@@ -47,6 +54,7 @@ impl Settings {
             "talent_cap",
             "auto_update",
             "gui_disabled",
+            "detection_mode",
         ] {
             if let Some(value) = source.get(key) {
                 fields[key] = value.clone();
@@ -75,6 +83,26 @@ impl Settings {
             .ok_or_else(|| io::Error::other("Invalid game path."))?;
         let mut updated = self.fields.clone();
         updated["game_exe"] = json!(path);
+        self.save(updated)
+    }
+
+    pub fn detection_mode(&self) -> DetectionMode {
+        match self.fields["detection_mode"].as_str() {
+            Some("read_memory") => DetectionMode::ReadMemory,
+            _ => DetectionMode::Ocr,
+        }
+    }
+
+    pub fn set_detection_mode(&mut self, mode: DetectionMode) -> io::Result<()> {
+        let mut updated = self.fields.clone();
+        updated["detection_mode"] = json!(match mode {
+            DetectionMode::Ocr => "ocr",
+            DetectionMode::ReadMemory => "read_memory",
+        });
+        self.save(updated)
+    }
+
+    fn save(&mut self, updated: Value) -> io::Result<()> {
         let destination = self.directory.join("settings.json");
         let temporary = self
             .directory
