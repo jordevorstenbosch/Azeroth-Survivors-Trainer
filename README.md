@@ -6,15 +6,16 @@ A standalone Rust trainer for the original Azeroth Survivors fan game on Windows
 
 1. Download `AzerothSurvivorsTrainer.exe` from the [latest release](https://github.com/nelbin4/Azeroth-Survivors-Trainer/releases/latest).
 2. Open the trainer. On first use, choose **Locate game** and select `AzerothSurvivors.exe`.
-3. Start a solo run or a game you host. With **OCR** detection, open the character panel with **C**.
-4. Press **Start watcher** if the watcher is stopped. Use **Stop watcher** or close the trainer to stop rewriting stats.
+3. Start a solo run or a game you host.
+4. Press **Start watcher** if the watcher is stopped and gain experience. If the trainer prompts for the character panel, press **C** in-game.
 
 Use the trainer in solo runs or games you host. Gameplay testing covered solo runs.
 
-In **Settings → Detection Mode**, choose **OCR** to use the character panel or
-**Read Memory** to match the game's native stat messages against the live player
-record. In Read Memory, gain experience in a solo run so the watcher can
-distinguish the active record from stale copies.
+**Read Memory** is the default. It matches the game's native stat messages
+against the live player record as you gain experience. After three failed
+discovery attempts, the watcher switches to **OCR** for the current session and
+asks you to open the character panel. A new watcher session starts with your
+saved preference. You can choose **OCR** directly in **Settings → Detection Mode**.
 
 ## Supported stats
 

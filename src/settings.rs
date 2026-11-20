@@ -6,8 +6,8 @@ use std::{
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DetectionMode {
-    #[default]
     Ocr,
+    #[default]
     ReadMemory,
 }
 
@@ -88,8 +88,8 @@ impl Settings {
 
     pub fn detection_mode(&self) -> DetectionMode {
         match self.fields["detection_mode"].as_str() {
-            Some("read_memory") => DetectionMode::ReadMemory,
-            _ => DetectionMode::Ocr,
+            Some("ocr") => DetectionMode::Ocr,
+            _ => DetectionMode::default(),
         }
     }
 
@@ -117,5 +117,22 @@ impl Settings {
         }
         self.fields = updated;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detection_mode_defaults_to_read_memory_and_respects_explicit_ocr() {
+        let mut settings = Settings {
+            directory: PathBuf::new(),
+            fields: json!({}),
+        };
+        assert_eq!(settings.detection_mode(), DetectionMode::ReadMemory);
+
+        settings.fields["detection_mode"] = json!("ocr");
+        assert_eq!(settings.detection_mode(), DetectionMode::Ocr);
     }
 }
