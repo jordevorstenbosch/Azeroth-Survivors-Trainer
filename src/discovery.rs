@@ -31,7 +31,6 @@ use windows_sys::Win32::{
 const CHUNK: usize = 512 * 1024;
 const NAME_REACH: usize = 1536;
 const STAT_BYTES: usize = 32;
-const TARGET_FIELD_BYTES: usize = 56;
 const LEVEL_DISTANCE: usize = 104;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const VERIFIED_BUILD: &str = "ba09f96a327cadc24371b9dd8d876418c8d6dde298847fab318847be8c44cc5a";
@@ -39,8 +38,10 @@ const WRITER_RVA: usize = 0x5f7f01a;
 const WRITER_FILE_OFFSET: u64 = 0x5f7e41a;
 const WRITER_HASH: &str = "34ae43d72305c49c602a8194c0757a20753cf546c29d82b61d97001f50ffb50d";
 const NAME_DISTANCE: usize = 0x660 - 0x2a8;
+const NAME_OBJECT_OFFSET: usize = 0x2a8;
 const STAT_PACKET: &[u8] = b"AZS\x09hp=";
 const MAX_PACKET: usize = 1024;
+const HISTORICAL_NAME_DISTANCES: [usize; 3] = [NAME_DISTANCE, 912, 792];
 
 pub struct Target {
     pub name: &'static str,
@@ -68,6 +69,7 @@ impl Target {
 }
 
 pub type ActiveStats = [bool; 4];
+type WriteOffsets = [Option<usize>; 4];
 pub const TARGETS: [Target; 4] = [
     Target {
         name: "Damage",
@@ -98,6 +100,8 @@ pub const TARGETS: [Target; 4] = [
         baseline: 1.0,
     },
 ];
+const CURRENT_OFFSETS: [usize; 4] = [4, 44, 48, 52];
+const HISTORICAL_OFFSETS: [usize; 4] = [4, 40, 44, 48];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
@@ -130,37 +134,48 @@ impl Job {
                     let memory = Memory::open(instance, false)?;
                     let build = game::build_id(&path)?;
                     check_cancel(&worker_cancel)?;
-                    if build != VERIFIED_BUILD {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            format!("Freezing is unavailable for game build {}.", &build[..12]),
-                        ));
-                    }
+                    let known_build = build == VERIFIED_BUILD;
                     let _ = sender.send(Ok(Report {
                         build: build.clone(),
                         active: ActiveStats::default(),
                     }));
-                    let (actor, character, active) = if let Some(character) = character {
-                        let candidates = memory.scan(&character, &worker_cancel)?;
+                    let (actor, character, offsets) = if let Some(character) = character {
+                        let candidates = memory.scan(&character, &worker_cancel, known_build)?;
                         let (actor, active) = memory.verify_actor(
                             &candidates,
                             &character,
                             &worker_observation,
                             &worker_cancel,
+                            known_build,
                         )?;
                         (actor, character, active)
                     } else {
-                        memory.verify_stat_writer(instance, &path)?;
-                        let (actor, character) = memory.verify_native_actor(&worker_cancel)?;
-                        (actor, character, [true; 4])
+                        let mut distances = vec![NAME_DISTANCE];
+                        if known_build {
+                            memory.verify_stat_writer(instance, &path)?;
+                        } else {
+                            let stat_base =
+                                memory.find_stat_writer(instance, &path, &worker_cancel)?;
+                            distances.extend_from_slice(&HISTORICAL_NAME_DISTANCES[1..]);
+                            if let Some(distance) = stat_base.checked_sub(NAME_OBJECT_OFFSET)
+                                && distance <= NAME_REACH
+                                && !distances.contains(&distance)
+                            {
+                                distances.push(distance);
+                            }
+                        }
+                        let (actor, character) =
+                            memory.verify_native_actor(&worker_cancel, known_build, &distances)?;
+                        (actor, character, CURRENT_OFFSETS.map(Some))
                     };
                     let writer = Memory::open(instance, true)?;
                     writer.freeze(
                         actor,
-                        active,
+                        offsets,
                         &character,
                         &worker_observation,
                         &worker_cancel,
+                        known_build,
                         |active| {
                             let _ = sender.send(Ok(Report {
                                 build: build.clone(),
@@ -202,9 +217,35 @@ struct Actor {
     experience: u32,
     health: f32,
     stats: [f32; 4],
+    historical_area: f32,
+    level_after_stats: bool,
 }
 
 impl Memory {
+    fn find_stat_writer(
+        &self,
+        instance: game::ProcessInstance,
+        path: &Path,
+        cancel: &AtomicBool,
+    ) -> io::Result<usize> {
+        let image = std::fs::read(path)?;
+        let (code, rva) = text_section(&image)
+            .ok_or_else(|| io::Error::other("The executable has no readable .text section."))?;
+        let (start, end, stat_base) = find_writer(code, cancel)?;
+        let address = game::module_base(instance.pid, path)?
+            .checked_add(rva)
+            .and_then(|base| base.checked_add(start))
+            .ok_or_else(|| io::Error::other("Invalid stat writer address."))?;
+        let mut loaded = vec![0; end - start];
+        self.read(address, &mut loaded)?;
+        if loaded != code[start..end] {
+            return Err(io::Error::other(
+                "The loaded stat writer differs from the game file.",
+            ));
+        }
+        Ok(stat_base as usize)
+    }
+
     fn verify_stat_writer(&self, instance: game::ProcessInstance, path: &Path) -> io::Result<()> {
         let mut file = File::open(path)?;
         file.seek(io::SeekFrom::Start(WRITER_FILE_OFFSET))?;
@@ -259,12 +300,12 @@ impl Memory {
         Ok(())
     }
 
-    fn actor(&self, base: usize, header: usize, character: &str) -> io::Result<Actor> {
-        let actual = self.actor_name(header)?;
+    fn actor(&self, record: Actor, character: &str) -> io::Result<Actor> {
+        let actual = self.actor_name(record.header)?;
         if !actual.eq_ignore_ascii_case(character) {
             return Err(io::Error::other("Character name changed."));
         }
-        self.actor_stats(base, header)
+        self.actor_stats(record.base, record.header, record.level_after_stats)
     }
 
     fn actor_name(&self, header: usize) -> io::Result<String> {
@@ -281,11 +322,26 @@ impl Memory {
         Ok(name.to_owned())
     }
 
-    fn actor_stats(&self, base: usize, header: usize) -> io::Result<Actor> {
-        let mut bytes = [0; LEVEL_DISTANCE + TARGET_FIELD_BYTES];
-        self.read(base - LEVEL_DISTANCE, &mut bytes)?;
-        let level = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        let experience = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    fn actor_stats(
+        &self,
+        base: usize,
+        header: usize,
+        level_after_stats: bool,
+    ) -> io::Result<Actor> {
+        let mut bytes = [0; 2 * LEVEL_DISTANCE + 8];
+        let size = if level_after_stats {
+            bytes.len()
+        } else {
+            LEVEL_DISTANCE + 56
+        };
+        self.read(base - LEVEL_DISTANCE, &mut bytes[..size])?;
+        let level_index = if level_after_stats {
+            2 * LEVEL_DISTANCE
+        } else {
+            0
+        };
+        let level = read_u32(&bytes, level_index).unwrap();
+        let experience = read_u32(&bytes, level_index + 4).unwrap();
         let hp = f32::from_le_bytes(
             bytes[LEVEL_DISTANCE..LEVEL_DISTANCE + 4]
                 .try_into()
@@ -305,35 +361,68 @@ impl Memory {
             experience,
             health: hp,
             stats,
+            historical_area: f32::from_bits(read_u32(&bytes, LEVEL_DISTANCE + 40).unwrap()),
+            level_after_stats,
         })
     }
 
     fn verify_actor(
         &self,
-        candidates: &[(usize, usize)],
+        candidates: &[(usize, usize, bool)],
         character: &str,
         observation: &Mutex<Option<hud::Player>>,
         cancel: &AtomicBool,
-    ) -> io::Result<(Actor, ActiveStats)> {
+        known_build: bool,
+    ) -> io::Result<(Actor, WriteOffsets)> {
         if candidates.is_empty() {
             return Err(io::Error::other(
                 "The named solo character is not in memory yet.",
             ));
         }
         let deadline = Instant::now() + Duration::from_secs(50);
+        let mut previous = HashMap::new();
+        let mut recent_progress = HashMap::new();
         while Instant::now() < deadline {
             check_cancel(cancel)?;
-            let current = candidates
+            let current: Vec<_> = candidates
                 .iter()
-                .filter_map(|&(base, header)| self.actor(base, header, character).ok());
+                .filter_map(|&(base, header, level_after_stats)| {
+                    self.actor_stats(base, header, level_after_stats)
+                        .ok()
+                        .filter(|_| {
+                            self.actor_name(header)
+                                .is_ok_and(|name| name.eq_ignore_ascii_case(character))
+                        })
+                })
+                .collect();
+            let now = Instant::now();
+            recent_progress
+                .retain(|_, observed| now.duration_since(*observed) <= Duration::from_secs(5));
+            for &actor in &current {
+                let key = actor_key(actor);
+                if progressed(&previous, actor) {
+                    recent_progress.insert(key, now);
+                } else if previous.get(&key).is_none_or(|old| actor.level < old.level) {
+                    recent_progress.remove(&key);
+                }
+            }
             let player = observation.lock().unwrap().clone();
             if let Some(selected) = player
                 .as_ref()
                 .filter(|player| player.name.eq_ignore_ascii_case(character))
-                .and_then(|player| unique_panel_match(current, player))
+                .and_then(|player| {
+                    unique_panel_match(
+                        current.iter().copied().filter(|actor| {
+                            known_build || recent_progress.contains_key(&actor_key(*actor))
+                        }),
+                        player,
+                        known_build,
+                    )
+                })
             {
                 return Ok(selected);
             }
+            previous = actor_samples(current);
             thread::sleep(POLL_INTERVAL);
         }
         Err(io::Error::other(
@@ -344,39 +433,42 @@ impl Memory {
     fn freeze(
         &self,
         mut actor: Actor,
-        mut active: ActiveStats,
+        mut offsets: WriteOffsets,
         character: &str,
         observation: &Mutex<Option<hud::Player>>,
         cancel: &AtomicBool,
+        known_build: bool,
         mut on_active: impl FnMut(ActiveStats),
     ) -> io::Result<()> {
         let mut reported = ActiveStats::default();
         let mut next_tick = Instant::now();
         loop {
             check_cancel(cancel)?;
-            let fresh = self.actor(actor.base, actor.header, character)?;
+            let fresh = self.actor(actor, character)?;
             if fresh.level < actor.level {
                 return Err(io::Error::other(
                     "The solo run changed. Reacquiring the character.",
                 ));
             }
             actor = fresh;
-            if !active.iter().all(|&enabled| enabled)
+            if offsets.contains(&None)
                 && let Some(player) = observation
                     .lock()
                     .unwrap()
                     .as_ref()
                     .filter(|player| player.name.eq_ignore_ascii_case(character))
             {
-                active = extend_active(active, matched_stats(actor, player));
+                offsets = panel_offsets(actor, player, known_build, offsets);
             }
-            for (target, enabled) in TARGETS.iter().zip(active) {
-                if !enabled {
-                    continue;
-                }
+            for (target, offset) in TARGETS
+                .iter()
+                .zip(offsets)
+                .filter_map(|(target, offset)| Some((target, offset?)))
+            {
                 check_cancel(cancel)?;
-                self.write_stat(actor.base + target.offset, target.value)?;
+                self.write_stat(actor.base + offset, target.value)?;
             }
+            let active = offsets.map(|offset| offset.is_some());
             if reported != active {
                 on_active(active);
                 reported = active;
@@ -411,7 +503,12 @@ impl Memory {
         Ok(())
     }
 
-    fn scan(&self, character: &str, cancel: &AtomicBool) -> io::Result<Vec<(usize, usize)>> {
+    fn scan(
+        &self,
+        character: &str,
+        cancel: &AtomicBool,
+        known_build: bool,
+    ) -> io::Result<Vec<(usize, usize, bool)>> {
         let mut matching = Vec::new();
         self.scan_chunks(cancel, |from, bytes, start, end| {
             for offset in candidate_offsets(bytes, start, end) {
@@ -422,7 +519,10 @@ impl Memory {
                             .actor_name(from + header)
                             .is_ok_and(|name| name.eq_ignore_ascii_case(character))
                     {
-                        matching.push((from + offset, from + header));
+                        matching.push((from + offset, from + header, false));
+                        if !known_build {
+                            matching.push((from + offset, from + header, true));
+                        }
                         break;
                     }
                 }
@@ -432,18 +532,35 @@ impl Memory {
         Ok(matching)
     }
 
-    fn native_snapshot(&self, cancel: &AtomicBool) -> io::Result<(Vec<Actor>, Vec<NativeStats>)> {
+    fn native_snapshot(
+        &self,
+        cancel: &AtomicBool,
+        known_build: bool,
+        distances: &[usize],
+    ) -> io::Result<(Vec<Actor>, Vec<NativeStats>)> {
         let mut actors = Vec::new();
         let mut packets = Vec::new();
         self.scan_chunks(cancel, |from, bytes, start, end| {
             for offset in candidate_offsets(bytes, start, end) {
                 check_cancel(cancel)?;
-                if offset >= NAME_DISTANCE {
-                    let header = from + offset - NAME_DISTANCE;
-                    if let Ok(actor) = self.actor_stats(from + offset, header)
-                        && self.actor_name(header).is_ok()
-                    {
-                        actors.push(actor);
+                for header in distances
+                    .iter()
+                    .filter_map(|distance| offset.checked_sub(*distance))
+                {
+                    let header = from + header;
+                    if self.actor_name(header).is_err() {
+                        continue;
+                    }
+                    for &level_after_stats in if known_build {
+                        &[false][..]
+                    } else {
+                        &[false, true][..]
+                    } {
+                        if let Ok(actor) =
+                            self.actor_stats(from + offset, header, level_after_stats)
+                        {
+                            actors.push(actor);
+                        }
                     }
                 }
             }
@@ -466,14 +583,19 @@ impl Memory {
         Ok((actors, packets))
     }
 
-    fn verify_native_actor(&self, cancel: &AtomicBool) -> io::Result<(Actor, String)> {
+    fn verify_native_actor(
+        &self,
+        cancel: &AtomicBool,
+        known_build: bool,
+        distances: &[usize],
+    ) -> io::Result<(Actor, String)> {
         let deadline = Instant::now() + Duration::from_secs(35);
         let mut previous = HashMap::new();
         loop {
-            let (actors, packets) = self.native_snapshot(cancel)?;
+            let (actors, packets) = self.native_snapshot(cancel, known_build, distances)?;
             if let Some(selected) = native_actor(&previous, &actors, &packets) {
                 let name = self.actor_name(selected.header)?;
-                let current = self.actor(selected.base, selected.header, &name)?;
+                let current = self.actor(selected, &name)?;
                 if packets.iter().any(|packet| packet.matches(current)) {
                     return Ok((current, name));
                 }
@@ -483,10 +605,7 @@ impl Memory {
                     "Waiting for one live character to match the native stat feed. Gain experience in a solo run.",
                 ));
             }
-            previous = actors
-                .into_iter()
-                .map(|actor| (actor.base, actor))
-                .collect();
+            previous = actor_samples(actors);
             thread::sleep(POLL_INTERVAL);
         }
     }
@@ -592,22 +711,46 @@ fn native_stats(packet: &[u8]) -> Option<NativeStats> {
     })
 }
 
+type ActorSamples = HashMap<(usize, usize, bool), Actor>;
+
+fn actor_key(actor: Actor) -> (usize, usize, bool) {
+    (actor.base, actor.header, actor.level_after_stats)
+}
+
+fn actor_samples(actors: Vec<Actor>) -> ActorSamples {
+    actors
+        .into_iter()
+        .map(|actor| (actor_key(actor), actor))
+        .collect()
+}
+
+fn progressed(previous: &ActorSamples, actor: Actor) -> bool {
+    previous.get(&actor_key(actor)).is_some_and(|old| {
+        actor.level > old.level
+            || (actor.level == old.level
+                && !actor.level_after_stats
+                && actor.experience > old.experience)
+    })
+}
+
 fn native_actor(
-    previous: &HashMap<usize, Actor>,
+    previous: &ActorSamples,
     actors: &[Actor],
     packets: &[NativeStats],
 ) -> Option<Actor> {
     let mut live = actors.iter().copied().filter(|actor| {
-        previous.get(&actor.base).is_some_and(|old| {
-            actor.level > old.level
-                || (actor.level == old.level && actor.experience > old.experience)
-        }) && packets.iter().any(|packet| packet.matches(*actor))
+        progressed(previous, *actor) && packets.iter().any(|packet| packet.matches(*actor))
     });
     let actor = live.next()?;
     live.next().is_none().then_some(actor)
 }
 
-fn matched_stats(actor: Actor, player: &hud::Player) -> ActiveStats {
+fn panel_offsets(
+    actor: Actor,
+    player: &hud::Player,
+    known_build: bool,
+    bound: WriteOffsets,
+) -> WriteOffsets {
     if player.captured.elapsed() > Duration::from_secs(5)
         || (player.level.is_none() && player.health.is_none())
         || player.level.is_some_and(|level| level != actor.level)
@@ -615,30 +758,44 @@ fn matched_stats(actor: Actor, player: &hud::Player) -> ActiveStats {
             .health
             .is_some_and(|health| (health - actor.health).abs() > 1.1)
     {
-        return ActiveStats::default();
+        return bound;
     }
+    let observed = |index: usize, value: f32| {
+        player.stats[index].is_some_and(|expected| (expected - value).abs() <= 0.0051)
+    };
+    if known_build {
+        return std::array::from_fn(|index| {
+            bound[index]
+                .or_else(|| observed(index, actor.stats[index]).then_some(CURRENT_OFFSETS[index]))
+        });
+    }
+    let historical_values = [
+        actor.stats[0],
+        actor.historical_area,
+        actor.stats[1],
+        actor.stats[2],
+    ];
+    let compatible = |offsets: [usize; 4], values: [f32; 4]| {
+        (0..4).all(|index| match bound[index] {
+            Some(offset) => offset == offsets[index],
+            None => player.stats[index].is_none() || observed(index, values[index]),
+        })
+    };
+    let current = compatible(CURRENT_OFFSETS, actor.stats);
+    let historical = compatible(HISTORICAL_OFFSETS, historical_values);
     std::array::from_fn(|index| {
-        player.stats[index].is_some_and(|value| (value - actor.stats[index]).abs() <= 0.0051)
+        bound[index].or_else(|| {
+            player.stats[index]?;
+            match (current, historical) {
+                (true, false) => Some(CURRENT_OFFSETS[index]),
+                (false, true) => Some(HISTORICAL_OFFSETS[index]),
+                (true, true) if CURRENT_OFFSETS[index] == HISTORICAL_OFFSETS[index] => {
+                    Some(CURRENT_OFFSETS[index])
+                }
+                _ => None,
+            }
+        })
     })
-}
-
-fn unique_panel_match(
-    actors: impl Iterator<Item = Actor>,
-    player: &hud::Player,
-) -> Option<(Actor, ActiveStats)> {
-    let mut matches = actors.filter_map(|actor| {
-        let active = matched_stats(actor, player);
-        active
-            .iter()
-            .any(|&enabled| enabled)
-            .then_some((actor, active))
-    });
-    let selection = matches.next()?;
-    matches.next().is_none().then_some(selection)
-}
-
-fn extend_active(active: ActiveStats, matched: ActiveStats) -> ActiveStats {
-    std::array::from_fn(|index| active[index] || matched[index])
 }
 
 impl Drop for Memory {
@@ -653,6 +810,131 @@ fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn unique_panel_match(
+    actors: impl Iterator<Item = Actor>,
+    player: &hud::Player,
+    known_build: bool,
+) -> Option<(Actor, WriteOffsets)> {
+    let mut matches = actors.filter_map(|actor| {
+        let offsets = panel_offsets(actor, player, known_build, [None; 4]);
+        offsets
+            .iter()
+            .any(Option::is_some)
+            .then_some((actor, offsets))
+    });
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn text_section(image: &[u8]) -> Option<(&[u8], usize)> {
+    if !image.starts_with(b"MZ") {
+        return None;
+    }
+    let pe = read_u32(image, 0x3c)? as usize;
+    if image.get(pe..pe + 4)? != b"PE\0\0" || read_u16(image, pe + 4)? != 0x8664 {
+        return None;
+    }
+    let count = read_u16(image, pe + 6)? as usize;
+    let table = pe + 24 + read_u16(image, pe + 20)? as usize;
+    for index in 0..count {
+        let section = image.get(table + index * 40..table + (index + 1) * 40)?;
+        if &section[..8] == b".text\0\0\0" {
+            let rva = read_u32(section, 12)? as usize;
+            let size = read_u32(section, 16)?.min(read_u32(section, 8)?) as usize;
+            let start = read_u32(section, 20)? as usize;
+            return Some((image.get(start..start + size)?, rva));
+        }
+    }
+    None
+}
+
+// Parse the memory operand of the SSE instructions used by the known stat writer.
+fn writer_operand(code: &[u8], start: usize, scalar: bool, opcode: u8) -> Option<(u8, u32, usize)> {
+    let mut cursor = start;
+    if scalar {
+        if *code.get(cursor)? != 0xf3 {
+            return None;
+        }
+        cursor += 1;
+    }
+    let rex = *code.get(cursor)?;
+    let extended = (0x40..=0x4f).contains(&rex);
+    cursor += usize::from(extended);
+    if code.get(cursor..cursor + 2)? != [0x0f, opcode] {
+        return None;
+    }
+    let mode = *code.get(cursor + 2)?;
+    let base = mode & 7;
+    if mode & 0xc0 != 0x80 || base == 4 {
+        return None;
+    }
+    let base = base + u8::from(extended && rex & 1 != 0) * 8;
+    Some((base, read_u32(code, cursor + 3)?, cursor + 7))
+}
+
+fn writer_end(code: &[u8], start: usize) -> Option<(usize, u32)> {
+    let (object, anchor, cursor) = writer_operand(code, start, true, 0x5c)?;
+    if !(0x100..=0x4000).contains(&anchor) {
+        return None;
+    }
+    let expected = [0, 4, 8, 12, 20, 24, 28, 32, 36, 40, 44, 48, 52];
+    let mut offsets = expected.into_iter();
+    let mut search = cursor;
+    while search < (start + 350).min(code.len()) {
+        let scalar = writer_operand(code, search, true, 0x11);
+        match scalar.or_else(|| writer_operand(code, search, false, 0x13)) {
+            Some((base, displacement, end)) if base == object => {
+                let offset = offsets.next()?;
+                if anchor.checked_add(offset)? != displacement || scalar.is_none() != (offset == 12)
+                {
+                    return None;
+                }
+                if offset == 52 {
+                    return Some((end, anchor));
+                }
+                search = end;
+            }
+            Some((_, _, end)) => search = end,
+            None => search += 1,
+        }
+    }
+    None
+}
+
+fn find_writer(code: &[u8], cancel: &AtomicBool) -> io::Result<(usize, usize, u32)> {
+    let mut found = None;
+    for (index, chunk) in code.chunks(CHUNK).enumerate() {
+        check_cancel(cancel)?;
+        for (offset, &byte) in chunk.iter().enumerate() {
+            if byte == 0xf3 {
+                let start = index * CHUNK + offset;
+                if let Some((end, stat_base)) = writer_end(code, start)
+                    && found.replace((start, end, stat_base)).is_some()
+                {
+                    return Err(io::Error::other(
+                        "Several code locations match the stat writer.",
+                    ));
+                }
+            }
+        }
+    }
+    found.ok_or_else(|| {
+        io::Error::other("Could not find the stat writer pattern in this game build.")
+    })
 }
 
 fn candidate_offsets(bytes: &[u8], start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
@@ -806,23 +1088,25 @@ mod tests {
             experience: 10,
             health: 839.3,
             stats: [3.338, 1.36, 0.0, 1.31],
+            historical_area: 5.0,
+            level_after_stats: false,
         };
         let stale = Actor {
             base: 3000,
             level: 1,
             ..live
         };
-        let (actor, active) = unique_panel_match([stale, live].into_iter(), &player).unwrap();
+        let (actor, active) = unique_panel_match([stale, live].into_iter(), &player, true).unwrap();
         assert_eq!(actor.base, live.base);
-        assert_eq!(active, [false, true, false, false]);
+        assert_eq!(active, [None, Some(44), None, None]);
 
         player.stats = [None, None, None, Some(1.31)];
-        let active = extend_active(active, matched_stats(live, &player));
-        assert_eq!(active, [false, true, false, true]);
+        let active = panel_offsets(live, &player, true, active);
+        assert_eq!(active, [None, Some(44), None, Some(52)]);
         player.stats = [Some(3.34), None, Some(0.0), None];
         assert_eq!(
-            extend_active(active, matched_stats(live, &player)),
-            [true; 4]
+            panel_offsets(live, &player, true, active),
+            CURRENT_OFFSETS.map(Some)
         );
     }
 
@@ -842,14 +1126,16 @@ mod tests {
             experience: 10,
             health: 839.3,
             stats: [3.338, 1.36, 0.0, 1.31],
+            historical_area: 5.0,
+            level_after_stats: false,
         };
         let duplicate = Actor { base: 4000, ..live };
-        assert!(unique_panel_match([duplicate, live].into_iter(), &player).is_none());
+        assert!(unique_panel_match([duplicate, live].into_iter(), &player, true).is_none());
         let old = hud::Player {
             captured: Instant::now() - Duration::from_secs(6),
             ..player
         };
-        assert!(unique_panel_match([live].into_iter(), &old).is_none());
+        assert!(unique_panel_match([live].into_iter(), &old, true).is_none());
     }
 
     #[test]
@@ -864,17 +1150,16 @@ mod tests {
             experience: 70,
             health: 928.4,
             stats: [3.457, 1.358, 0.0, 1.31],
+            historical_area: 5.0,
+            level_after_stats: false,
         };
         let stale = Actor { base: 2000, ..live };
-        let previous = HashMap::from([
-            (
-                live.base,
-                Actor {
-                    experience: 68,
-                    ..live
-                },
-            ),
-            (stale.base, stale),
+        let previous = actor_samples(vec![
+            Actor {
+                experience: 68,
+                ..live
+            },
+            stale,
         ]);
         assert_eq!(
             native_actor(&previous, &[live, stale], &[packet])
@@ -891,5 +1176,61 @@ mod tests {
             },
         ];
         assert!(native_actor(&previous, &both, &[packet]).is_none());
+    }
+
+    #[test]
+    fn unknown_build_discovers_damage_and_then_earlier_layout_offsets() {
+        let mut player = hud::Player {
+            name: "Hero".into(),
+            level: Some(20),
+            health: Some(839.0),
+            stats: [Some(3.34), None, None, None],
+            captured: Instant::now(),
+        };
+        let live = Actor {
+            base: 2000,
+            header: 1200,
+            level: 20,
+            experience: 0,
+            health: 839.3,
+            stats: [3.338, 0.36, 1.31, 0.0],
+            historical_area: 1.36,
+            level_after_stats: true,
+        };
+        let bound = panel_offsets(live, &player, false, [None; 4]);
+        assert_eq!(bound, [Some(4), None, None, None]);
+        player.stats = [None, Some(1.36), Some(0.36), Some(1.31)];
+        assert_eq!(
+            panel_offsets(live, &player, false, bound),
+            HISTORICAL_OFFSETS.map(Some)
+        );
+
+        player.stats = [None, Some(1.36), None, None];
+        let ambiguous = Actor {
+            stats: [3.338, 1.36, 1.31, 0.0],
+            ..live
+        };
+        assert_eq!(panel_offsets(ambiguous, &player, false, bound), bound);
+    }
+
+    #[test]
+    fn writer_search_accepts_relocated_code_and_rejects_duplicates() {
+        let base = 0x660_u32;
+        let mut code = vec![0x90; 32];
+        code.extend([0xf3, 0x0f, 0x5c, 0x87]);
+        code.extend(base.to_le_bytes());
+        for offset in [0, 4, 8, 12, 20, 24, 28, 32, 36, 40, 44, 48, 52] {
+            if offset == 12 {
+                code.extend([0x0f, 0x13, 0x87]);
+            } else {
+                code.extend([0xf3, 0x0f, 0x11, 0x87]);
+            }
+            code.extend((base + offset).to_le_bytes());
+        }
+        let cancel = AtomicBool::new(false);
+        assert_eq!(find_writer(&code, &cancel).unwrap(), (32, code.len(), base));
+        let duplicate = code.clone();
+        code.extend(duplicate);
+        assert!(find_writer(&code, &cancel).is_err());
     }
 }

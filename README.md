@@ -17,6 +17,13 @@ discovery attempts, the watcher switches to **OCR** for the current session and
 asks you to open the character panel. A new watcher session starts with your
 saved preference. You can choose **OCR** directly in **Settings → Detection Mode**.
 
+On an unfamiliar game build, Read Memory searches for the stat writer in the
+executable and matches the live record against the native stat messages. OCR
+checks the character name, gameplay progress and visible values against the
+documented stat layouts. Each verified stat starts freezing as soon as it is
+available. If the game's layout or messages change beyond what the watcher
+can verify, it keeps retrying.
+
 ## Supported stats
 
 | Stat | Target |
@@ -31,8 +38,7 @@ The watcher starts rewriting verified stats every 0.5 seconds and keeps using th
 ## Updates and troubleshooting
 
 - **Check updates** checks GitHub. When a newer Rust release is available, **Download & Install** verifies and installs the executable and restarts the trainer.
-- **Finding your character** means the watcher is waiting for the character panel. Keep it open until the trainer shows **Stats frozen**.
-- **Unsupported game build** means this release cannot freeze stats on that executable. The verified Windows game build starts with SHA-256 `ba09f96a327c`.
+- **Finding your character** means the watcher is waiting for the character panel. Keep it open while the watcher verifies your stats. On an unfamiliar build, continue gaining experience or level up during discovery.
 - Settings and `trainer.log` are stored under `%LOCALAPPDATA%\Azeroth Survivors Trainer`.
 
 The [Python v2.1.3 release](https://github.com/nelbin4/Azeroth-Survivors-Trainer/releases/tag/v2.1.3) remains available for users of the legacy trainer.

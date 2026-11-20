@@ -87,7 +87,6 @@ enum DiscoveryPhase {
     WaitingForPanel,
     Freezing,
     Retrying,
-    Unsupported,
 }
 
 enum UpdateControl {
@@ -399,10 +398,6 @@ impl Window {
                     "Reconnecting",
                     "The watcher will look for the character record again.",
                 ),
-                DiscoveryPhase::Unsupported => (
-                    "Unsupported game build",
-                    "Freezing requires a verified game build.",
-                ),
             }
         };
         self.text(
@@ -428,7 +423,7 @@ impl Window {
         } else if !self.discovery_message.is_empty()
             && matches!(
                 self.discovery_phase,
-                DiscoveryPhase::Searching | DiscoveryPhase::Retrying | DiscoveryPhase::Unsupported
+                DiscoveryPhase::Searching | DiscoveryPhase::Retrying
             )
         {
             self.discovery_message.clone()
@@ -638,7 +633,7 @@ impl Window {
     }
 
     fn poll_discovery(&mut self, path: &Path) -> bool {
-        if !self.watching || self.discovery_phase == DiscoveryPhase::Unsupported {
+        if !self.watching {
             return false;
         }
         let Some(instance) = self.game_instance else {
@@ -687,11 +682,6 @@ impl Window {
                             },
                         )
                     }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
-                    self.discovery = None;
-                    self.active_stats.fill(false);
-                    (DiscoveryPhase::Unsupported, error.to_string())
                 }
                 Err(error) => return self.discovery_failed(&error.to_string()),
             })
@@ -817,7 +807,6 @@ impl Window {
             }
         }
         if self.watching
-            && self.discovery_phase != DiscoveryPhase::Unsupported
             && self.active_stats.contains(&false)
             && self.capture.is_none()
             && Instant::now() >= self.next_capture
