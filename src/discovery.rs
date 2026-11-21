@@ -465,15 +465,28 @@ impl Memory {
         cancel: &AtomicBool,
         known_build: bool,
     ) -> io::Result<Vec<(usize, usize, bool)>> {
-        self.scan_chunks(cancel, |from, bytes, start, end, matching| {
-            for offset in candidate_offsets(bytes, start, end) {
+        let stat_matches = AtomicUsize::new(0);
+        let level_matches = AtomicUsize::new(0);
+        let header_matches = AtomicUsize::new(0);
+        let readable_names = AtomicUsize::new(0);
+        let candidates = self.scan_chunks(cancel, |from, bytes, start, end, matching| {
+            let mut chunk_stat_matches = 0;
+            let mut chunk_level_matches = 0;
+            let mut chunk_header_matches = 0;
+            let mut chunk_readable_names = 0;
+            for offset in candidate_offsets(bytes, start, end, || chunk_stat_matches += 1) {
                 check_cancel(cancel)?;
+                chunk_level_matches += 1;
                 for (header, _, length) in name_headers(&bytes[..offset]) {
-                    if length == character.len()
-                        && self
-                            .actor_name(from + header)
-                            .is_ok_and(|name| name.eq_ignore_ascii_case(character))
-                    {
+                    if length != character.len() {
+                        continue;
+                    }
+                    chunk_header_matches += 1;
+                    let Ok(name) = self.actor_name(from + header) else {
+                        continue;
+                    };
+                    chunk_readable_names += 1;
+                    if name.eq_ignore_ascii_case(character) {
                         matching.push((from + offset, from + header, false));
                         if !known_build {
                             matching.push((from + offset, from + header, true));
@@ -482,8 +495,21 @@ impl Memory {
                     }
                 }
             }
+            stat_matches.fetch_add(chunk_stat_matches, Ordering::Relaxed);
+            level_matches.fetch_add(chunk_level_matches, Ordering::Relaxed);
+            header_matches.fetch_add(chunk_header_matches, Ordering::Relaxed);
+            readable_names.fetch_add(chunk_readable_names, Ordering::Relaxed);
             Ok(())
-        })
+        })?;
+        diagnostic_log::info(&format!(
+            "Discovery filters: {} stat blocks, {} also match level, {} same-length name headers, {} readable names, {} candidate records.",
+            stat_matches.load(Ordering::Relaxed),
+            level_matches.load(Ordering::Relaxed),
+            header_matches.load(Ordering::Relaxed),
+            readable_names.load(Ordering::Relaxed),
+            candidates.len(),
+        ));
+        Ok(candidates)
     }
 
     // Lists the readable memory as chunks, then scans them on several threads.
@@ -700,7 +726,12 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
-fn candidate_offsets(bytes: &[u8], start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
+fn candidate_offsets<'a>(
+    bytes: &'a [u8],
+    start: usize,
+    end: usize,
+    mut on_stat_match: impl FnMut() + 'a,
+) -> impl Iterator<Item = usize> + 'a {
     // Use the 2.1.3 stat shape as a discovery hint. The two known level positions
     // cover the name-based and pattern-based layouts.
     let ranges = [
@@ -719,11 +750,15 @@ fn candidate_offsets(bytes: &[u8], start: usize, end: usize) -> impl Iterator<It
             let Some(stats) = bytes.get(offset..offset + STAT_BYTES) else {
                 return false;
             };
-            stats
+            if !stats
                 .chunks_exact(4)
                 .zip(&ranges)
                 .all(|(raw, range)| range.contains(&f32::from_le_bytes(raw.try_into().unwrap())))
-                && [
+            {
+                return false;
+            }
+            on_stat_match();
+            [
                     offset.checked_sub(LEVEL_DISTANCE),
                     offset.checked_add(LEVEL_DISTANCE),
                 ]
@@ -778,12 +813,12 @@ mod tests {
         {
             slot.copy_from_slice(&stat.to_le_bytes());
         }
-        assert_eq!(candidate_offsets(&bytes, 0, bytes.len()).next(), None);
+        assert_eq!(candidate_offsets(&bytes, 0, bytes.len(), || {}).next(), None);
         let level = position + LEVEL_DISTANCE;
         bytes[level..level + 4].copy_from_slice(&3_u32.to_le_bytes());
-        assert_eq!(candidate_offsets(&bytes, 0, position).next(), None);
+        assert_eq!(candidate_offsets(&bytes, 0, position, || {}).next(), None);
         assert_eq!(
-            candidate_offsets(&bytes, position, bytes.len()).collect::<Vec<_>>(),
+            candidate_offsets(&bytes, position, bytes.len(), || {}).collect::<Vec<_>>(),
             [position]
         );
     }
