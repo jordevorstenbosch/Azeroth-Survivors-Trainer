@@ -29,6 +29,19 @@ use windows_sys::Win32::{
 const CHUNK: usize = 512 * 1024;
 const NAME_REACH: usize = 1536;
 const STAT_BYTES: usize = 32;
+const STAT_RANGES: [std::ops::RangeInclusive<f32>; 8] = [
+    50.0..=1e6,
+    0.5..=2e4,
+    0.000001..=10.0,
+    0.01..=200.0,
+    1.2..=200.0,
+    0.5..=3.0,
+    10.0..=1e4,
+    0.99..=1e6,
+];
+const STAT_NAMES: [&str; 8] = [
+    "HP", "Damage", "Haste", "Crit", "Crit damage", "Speed", "Pickup", "XP",
+];
 const LEVEL_DISTANCE: usize = 104;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const VERIFIED_BUILD: &str = "ba09f96a327cadc24371b9dd8d876418c8d6dde298847fab318847be8c44cc5a";
@@ -481,6 +494,9 @@ impl Memory {
         let panel_level_before = AtomicUsize::new(0);
         let panel_level_after = AtomicUsize::new(0);
         let panel_stat_and_level_matches = AtomicUsize::new(0);
+        let failures: [AtomicUsize; 8] = std::array::from_fn(|_| AtomicUsize::new(0));
+        let incomplete_blocks = AtomicUsize::new(0);
+        let named_panel_blocks = AtomicUsize::new(0);
         let candidates = self.scan_chunks(cancel, |from, bytes, start, end, matching| {
             let mut chunk_stat_matches = 0;
             let mut chunk_level_matches = 0;
@@ -492,11 +508,42 @@ impl Memory {
                         continue;
                     }
                     panel_health_matches.fetch_add(1, Ordering::Relaxed);
-                    if offset.checked_sub(LEVEL_DISTANCE).and_then(|at| read_u32(bytes, at)) == Some(level) {
+                    let level_before = offset.checked_sub(LEVEL_DISTANCE)
+                        .and_then(|at| read_u32(bytes, at)) == Some(level);
+                    let level_after = offset.checked_add(LEVEL_DISTANCE)
+                        .and_then(|at| read_u32(bytes, at)) == Some(level);
+                    if level_before {
                         panel_level_before.fetch_add(1, Ordering::Relaxed);
                     }
-                    if offset.checked_add(LEVEL_DISTANCE).and_then(|at| read_u32(bytes, at)) == Some(level) {
+                    if level_after {
                         panel_level_after.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if !level_before && !level_after {
+                        continue;
+                    }
+                    let Some(stats) = bytes.get(offset..offset + STAT_BYTES) else {
+                        incomplete_blocks.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    let mut rejected = Vec::new();
+                    for (index, (raw, range)) in stats.chunks_exact(4).zip(&STAT_RANGES).enumerate() {
+                        let value = f32::from_le_bytes(raw.try_into().unwrap());
+                        if !range.contains(&value) {
+                            failures[index].fetch_add(1, Ordering::Relaxed);
+                            rejected.push(format!("{}={value:?}", STAT_NAMES[index]));
+                        }
+                    }
+                    if name_headers(&bytes[..offset]).any(|(header, _, length)| {
+                        length == character.len() && self.actor_name(from + header)
+                            .is_ok_and(|name| name.eq_ignore_ascii_case(character))
+                    }) {
+                        named_panel_blocks.fetch_add(1, Ordering::Relaxed);
+                        if !rejected.is_empty() {
+                            diagnostic_log::info(&format!(
+                                "Stat bounds rejected a block matching panel name, HP, and level: {}.",
+                                rejected.join(", ")
+                            ));
+                        }
                     }
                 }
             }
@@ -557,6 +604,14 @@ impl Memory {
                 panel_level_before.load(Ordering::Relaxed),
                 panel_level_after.load(Ordering::Relaxed),
                 panel_stat_and_level_matches.load(Ordering::Relaxed),
+            ));
+            let rejected = STAT_NAMES.iter().zip(&failures)
+                .map(|(name, count)| format!("{name} {}", count.load(Ordering::Relaxed)))
+                .collect::<Vec<_>>().join(", ");
+            diagnostic_log::info(&format!(
+                "Stat-bound rejections among exact-level HP matches: {rejected}. Incomplete blocks: {}. Matching name headers: {}.",
+                incomplete_blocks.load(Ordering::Relaxed),
+                named_panel_blocks.load(Ordering::Relaxed),
             ));
         } else {
             diagnostic_log::info("Panel correlation skipped: need a fresh reading with both HP and level.");
@@ -791,16 +846,6 @@ fn candidate_offsets<'a>(
 ) -> impl Iterator<Item = usize> + 'a {
     // Use the 2.1.3 stat shape as a discovery hint. The two known level positions
     // cover the name-based and pattern-based layouts.
-    let ranges = [
-        50.0..=1e6,
-        0.5..=2e4,
-        0.000001..=10.0,
-        0.01..=200.0,
-        1.2..=200.0,
-        0.5..=3.0,
-        10.0..=1e4,
-        0.99..=1e6,
-    ];
     (start.next_multiple_of(4)..end)
         .step_by(4)
         .filter(move |&offset| {
@@ -809,7 +854,7 @@ fn candidate_offsets<'a>(
             };
             if !stats
                 .chunks_exact(4)
-                .zip(&ranges)
+                .zip(&STAT_RANGES)
                 .all(|(raw, range)| range.contains(&f32::from_le_bytes(raw.try_into().unwrap())))
             {
                 return false;
