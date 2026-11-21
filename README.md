@@ -34,7 +34,7 @@ The watcher starts rewriting verified stats every 0.5 seconds and keeps using th
 
 - **Check updates** checks GitHub. When a newer Rust release is available, **Download & Install** verifies and installs the executable and restarts the trainer.
 - **Finding your character** means the watcher is waiting for the character panel. Keep it open while the watcher verifies your stats. On an unfamiliar build, continue gaining experience or level up during discovery.
-- Settings and `trainer.log` are stored under `%LOCALAPPDATA%\Azeroth Survivors Trainer`.
+- Settings and `run.log` are stored under `%LOCALAPPDATA%\Azeroth Survivors Trainer`. `run.log` keeps the newest 10 KB of timed events (startup, OCR panel reads, memory scan and verification timings, and discovery warnings).
 
 The [Python v2.1.3 release](https://github.com/nelbin4/Azeroth-Survivors-Trainer/releases/tag/v2.1.3) remains available for users of the legacy trainer.
 

@@ -30,7 +30,7 @@ use windows_sys::Win32::{
     },
     System::{
         LibraryLoader::GetModuleHandleW,
-        SystemServices::{SS_NOPREFIX, SS_OWNERDRAW, SS_RIGHT},
+        SystemServices::{SS_CENTER, SS_NOPREFIX, SS_OWNERDRAW, SS_RIGHT},
     },
     UI::{
         Controls::{
@@ -46,7 +46,12 @@ use windows_sys::Win32::{
 };
 
 const TITLE: &str = "Azeroth Survivors Trainer";
-const CHARACTER_PANEL_PROMPT: &str = "Open Character Panel (press C in-game)";
+const CHARACTER_PANEL_PROMPT: &str =
+    "Open the Character Panel (press C) until the trainer finds the value.";
+const CHARACTER_PANEL_PROMPT_LARGE: &str =
+    "Open the Character Panel\r\n(press C)\r\nuntil the trainer finds the value";
+const PROCESS_CHECK_INTERVAL: Duration = Duration::from_millis(1500);
+const PANEL_PROMPT_HEIGHT: i32 = 360;
 const REPO: &str = "https://github.com/nelbin4/Azeroth-Survivors-Trainer";
 const START: u16 = 100;
 const LAUNCH: u16 = 101;
@@ -61,6 +66,7 @@ const STOP: u16 = 112;
 const MUTED_TEXT: u16 = 113;
 const STAT_CARD: u16 = 115;
 const OPEN_SETTINGS: u16 = 116;
+const PANEL_PROMPT: u16 = 118;
 const PROCESS_LOOKUP_LIMIT: u8 = 10;
 const BACKGROUND: u32 = rgb(22, 23, 30);
 const TEXT: u32 = rgb(242, 241, 247);
@@ -104,6 +110,9 @@ struct Window {
     dpi: i32,
     font: Font,
     heading_font: Font,
+    prompt_font: Font,
+    ocr: hud::OcrWorker,
+    next_process_check: Instant,
     watching: bool,
     solo_character: Option<String>,
     running: bool,
@@ -269,7 +278,11 @@ impl Window {
 
         let active_count = self.active_stats.iter().filter(|&&active| active).count() as i32;
         let rows = (active_count + 1) / 2;
-        let height = if self.showing_settings || rows == 0 {
+        let height = if self.showing_settings {
+            228
+        } else if self.shows_panel_prompt() {
+            PANEL_PROMPT_HEIGHT
+        } else if rows == 0 {
             228
         } else {
             254 + rows * 62
@@ -335,6 +348,20 @@ impl Window {
         set_font(control, self.heading_font.handle());
     }
 
+    // The prompt stays up until every verified stat has been found and is frozen.
+    fn shows_panel_prompt(&self) -> bool {
+        !self.showing_settings
+            && self.watching
+            && self.running
+            && self.settings.game_path().is_some_and(game::valid_path)
+            && matches!(
+                self.discovery_phase,
+                DiscoveryPhase::Searching
+                    | DiscoveryPhase::WaitingForPanel
+                    | DiscoveryPhase::Retrying
+            )
+    }
+
     fn render_overview(&mut self, hwnd: HWND, rows: i32) {
         let freezing = rows != 0;
         let configured = self.settings.game_path().is_some_and(game::valid_path);
@@ -362,6 +389,20 @@ impl Window {
             launch_action,
         );
         self.text(hwnd, "", [18, 65, 464, 1], DIVIDER);
+
+        if self.shows_panel_prompt() {
+            // While the trainer waits for the panel, the prompt takes the whole body.
+            let prompt = self.child(
+                hwnd,
+                "STATIC",
+                CHARACTER_PANEL_PROMPT_LARGE,
+                SS_CENTER | SS_NOPREFIX,
+                [18, 96, 464, 200],
+                PANEL_PROMPT,
+            );
+            set_font(prompt, self.prompt_font.handle());
+            return;
+        }
 
         let (status, detail) = if !configured {
             (
@@ -522,8 +563,7 @@ impl Window {
     }
 
     fn log(&self, message: &str) {
-        let path = self.settings.directory.join("trainer.log");
-        let _ = diagnostic_log::append(&path, message);
+        diagnostic_log::info(message);
     }
 
     fn choose_game(&mut self, parent: HWND) -> bool {
@@ -571,6 +611,12 @@ impl Window {
             self.process_lookup_misses = 0;
             return self.set_game_instance(None);
         };
+        // Process enumeration is cheap but not free, so it runs less often than the OCR poll.
+        if Instant::now() < self.next_process_check {
+            self.poll_hud();
+            return self.poll_discovery(&path);
+        }
+        self.next_process_check = Instant::now() + PROCESS_CHECK_INTERVAL;
         let instance = match game::running_instance(&path) {
             Ok(Some(instance)) => {
                 self.process_lookup_misses = 0;
@@ -677,6 +723,7 @@ impl Window {
     }
 
     fn discovery_failed(&mut self, error: &str) -> bool {
+        diagnostic_log::warn(&format!("Discovery failed: {error}"));
         self.discovery = None;
         self.active_stats.fill(false);
         self.next_discovery = Instant::now() + Duration::from_secs(3);
@@ -712,10 +759,21 @@ impl Window {
                             if let (Some(job), Some(player)) = (&self.discovery, &reading.player) {
                                 job.observe(player.clone());
                             }
+                            let player_name = |reading: &hud::Reading| {
+                                reading.player.as_ref().map(|player| player.name.clone())
+                            };
                             let changed = self.capture_error.take().is_some()
-                                || self.reading.stats != reading.stats;
-                            if changed && !reading.stats.is_empty() {
-                                self.log(&format!("Visible values: {}", reading.stats.join(", ")));
+                                || self.reading.stats != reading.stats
+                                || player_name(&self.reading) != player_name(&reading);
+                            if changed {
+                                // Logged only on change, so the log keeps useful history.
+                                self.log(&format!(
+                                    "Panel read in {} ms (capture {} ms). Player: {}. Values: [{}].",
+                                    reading.total_ms,
+                                    reading.capture_ms,
+                                    describe_player(reading.player.as_ref()),
+                                    reading.stats.join(", ")
+                                ));
                             }
                             self.reading = reading;
                         }
@@ -736,11 +794,15 @@ impl Window {
         {
             if let Some(process) = self.game_instance {
                 let (sender, receiver) = mpsc::sync_channel(1);
-                std::thread::spawn(move || {
-                    let _ = sender.send(hud::read_ocr(process.pid));
-                });
+                self.ocr.request(process.pid, sender);
                 self.capture = Some((self.scan_generation, receiver));
-                self.next_capture = Instant::now() + Duration::from_secs(4);
+                // Poll quickly until the panel is read, then back off once the player is known.
+                let interval = if self.reading.player.is_some() {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(500)
+                };
+                self.next_capture = Instant::now() + interval;
             }
         }
     }
@@ -821,7 +883,7 @@ impl Window {
                 }
                 Some(Err(error)) => {
                     self.log(&format!("Update installation failed: {error}"));
-                    self.update_message = "Could not install the update. See trainer.log.".into();
+                    self.update_message = "Could not install the update. See run.log.".into();
                     UpdateControl::Available(release.clone())
                 }
             },
@@ -1059,6 +1121,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
                     READY_DOT => LIVE,
                     STATUS_DOT => rgb(173, 158, 242),
                     MUTED_TEXT => MUTED,
+                    PANEL_PROMPT => rgb(255, 214, 96),
                     DIVIDER => {
                         SetDCBrushColor(w as _, BORDER);
                         return GetStockObject(DC_BRUSH) as LRESULT;
@@ -1101,6 +1164,12 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
 
 fn run() -> std::io::Result<()> {
     let settings = Settings::load()?;
+    diagnostic_log::init(settings.directory.join("run.log"));
+    diagnostic_log::info(&format!(
+        "Trainer v{} starting. Process {}.",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    ));
     let solo_character = if let Some(mut args) = env::args_os().skip(1).find_map(|arg| {
         arg.to_str()
             .and_then(|arg| arg.strip_prefix("--solo-character="))
@@ -1128,6 +1197,9 @@ fn run() -> std::io::Result<()> {
             dpi,
             font: Font::new(dpi, 15, 400),
             heading_font: Font::new(dpi, 20, 600),
+            prompt_font: Font::new(dpi, 26, 700),
+            ocr: hud::OcrWorker::start(),
+            next_process_check: Instant::now(),
             watching: solo_character.is_some() || env::args_os().any(|arg| arg == "--autostart"),
             solo_character,
             running: false,
@@ -1191,7 +1263,7 @@ fn run() -> std::io::Result<()> {
         window.refresh_process();
         window.render(hwnd);
         ShowWindow(hwnd, SW_SHOWNORMAL);
-        SetTimer(hwnd, 1, 1500, None);
+        SetTimer(hwnd, 1, 500, None);
         let mut message: MSG = std::mem::zeroed();
         loop {
             let state = GetMessageW(&mut message, null_mut(), 0, 0);
@@ -1208,6 +1280,16 @@ fn run() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn describe_player(player: Option<&hud::Player>) -> String {
+    match player {
+        Some(player) => match player.level {
+            Some(level) => format!("{} level {level}", player.name),
+            None => player.name.clone(),
+        },
+        None => "not found".to_owned(),
+    }
 }
 
 fn main() {

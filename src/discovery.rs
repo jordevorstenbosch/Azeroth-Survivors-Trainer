@@ -1,11 +1,11 @@
-use crate::{game, hud};
+use crate::{diagnostic_log, game, hud};
 use std::{
     collections::HashMap,
     io,
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
     thread,
@@ -130,7 +130,18 @@ impl Job {
                         build: build.clone(),
                         active: ActiveStats::default(),
                     }));
+                    diagnostic_log::info(&format!(
+                        "Discovery started for {character}. Build {} known.",
+                        if known_build { "is" } else { "is not" }
+                    ));
+                    let scan_started = Instant::now();
                     let candidates = memory.scan(&character, &worker_cancel, known_build)?;
+                    diagnostic_log::info(&format!(
+                        "Memory scan found {} candidate records in {} ms.",
+                        candidates.len(),
+                        scan_started.elapsed().as_millis()
+                    ));
+                    let verify_started = Instant::now();
                     let (actor, offsets) = memory.verify_actor(
                         &candidates,
                         &character,
@@ -138,6 +149,11 @@ impl Job {
                         &worker_cancel,
                         known_build,
                     )?;
+                    diagnostic_log::info(&format!(
+                        "Live record verified in {} ms. Stat offsets {:?}.",
+                        verify_started.elapsed().as_millis(),
+                        offsets
+                    ));
                     let writer = Memory::open(instance, true)?;
                     writer.freeze(
                         actor,
@@ -178,6 +194,18 @@ impl Drop for Job {
 }
 
 struct Memory(HANDLE);
+
+// SAFETY: ReadProcessMemory and WriteProcessMemory may be called on one process
+// handle from several threads, and the scan only reads through the handle.
+unsafe impl Send for Memory {}
+unsafe impl Sync for Memory {}
+
+struct Chunk {
+    from: usize,
+    to: usize,
+    start: usize,
+    end: usize,
+}
 
 #[derive(Clone, Copy)]
 struct Actor {
@@ -437,8 +465,7 @@ impl Memory {
         cancel: &AtomicBool,
         known_build: bool,
     ) -> io::Result<Vec<(usize, usize, bool)>> {
-        let mut matching = Vec::new();
-        self.scan_chunks(cancel, |from, bytes, start, end| {
+        self.scan_chunks(cancel, |from, bytes, start, end, matching| {
             for offset in candidate_offsets(bytes, start, end) {
                 check_cancel(cancel)?;
                 for (header, _, length) in name_headers(&bytes[..offset]) {
@@ -456,17 +483,64 @@ impl Memory {
                 }
             }
             Ok(())
-        })?;
-        Ok(matching)
+        })
     }
 
-    fn scan_chunks(
+    // Lists the readable memory as chunks, then scans them on several threads.
+    fn scan_chunks<T: Send>(
         &self,
         cancel: &AtomicBool,
-        mut visit: impl FnMut(usize, &[u8], usize, usize) -> io::Result<()>,
-    ) -> io::Result<()> {
+        visit: impl Fn(usize, &[u8], usize, usize, &mut Vec<T>) -> io::Result<()> + Sync,
+    ) -> io::Result<Vec<T>> {
+        let chunks = self.readable_chunks(cancel)?;
+        let next = AtomicUsize::new(0);
+        let workers = thread::available_parallelism()
+            .map_or(4, |count| count.get())
+            .clamp(1, 8);
+        thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| -> io::Result<Vec<T>> {
+                        let mut found = Vec::new();
+                        let mut buffer = vec![0; CHUNK + NAME_REACH + MAX_PACKET];
+                        loop {
+                            check_cancel(cancel)?;
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(chunk) = chunks.get(index) else {
+                                return Ok(found);
+                            };
+                            let bytes = &mut buffer[..chunk.to - chunk.from];
+                            if self.read(chunk.from, bytes).is_err() {
+                                continue;
+                            }
+                            visit(chunk.from, bytes, chunk.start, chunk.end, &mut found)?;
+                        }
+                    })
+                })
+                .collect();
+            let mut results = Vec::new();
+            let mut failure = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(mut found)) => results.append(&mut found),
+                    Ok(Err(error)) => {
+                        failure.get_or_insert(error);
+                    }
+                    Err(_) => {
+                        failure.get_or_insert(io::Error::other("The memory scan stopped."));
+                    }
+                }
+            }
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(results),
+            }
+        })
+    }
+
+    fn readable_chunks(&self, cancel: &AtomicBool) -> io::Result<Vec<Chunk>> {
+        let mut chunks = Vec::new();
         let mut next = 0;
-        let mut buffer = vec![0; CHUNK + NAME_REACH + MAX_PACKET];
         loop {
             check_cancel(cancel)?;
             let mut region = MEMORY_BASIC_INFORMATION::default();
@@ -483,7 +557,7 @@ impl Memory {
                 // ERROR_INVALID_PARAMETER marks the end of user-mode addresses.
                 return if next != 0 && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
                 {
-                    Ok(())
+                    Ok(chunks)
                 } else {
                     Err(error)
                 };
@@ -501,15 +575,15 @@ impl Memory {
                 continue;
             }
             for cursor in (start..end).step_by(CHUNK) {
-                check_cancel(cancel)?;
                 let from = cursor.saturating_sub(NAME_REACH).max(start);
                 let last = cursor.saturating_add(CHUNK).min(end);
                 let to = last.saturating_add(MAX_PACKET).min(end);
-                let bytes = &mut buffer[..to - from];
-                if self.read(from, bytes).is_err() {
-                    continue;
-                }
-                visit(from, bytes, cursor - from, last - from)?;
+                chunks.push(Chunk {
+                    from,
+                    to,
+                    start: cursor - from,
+                    end: last - from,
+                });
             }
         }
     }

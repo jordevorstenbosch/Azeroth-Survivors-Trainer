@@ -1,6 +1,13 @@
-use crate::discovery::TARGETS;
+use crate::{diagnostic_log, discovery::TARGETS};
 use image::{RgbaImage, imageops::FilterType};
-use std::{io, ptr::null_mut, slice, time::Instant};
+use std::{
+    io,
+    ptr::null_mut,
+    slice,
+    sync::mpsc::{self, Sender, SyncSender},
+    thread,
+    time::Instant,
+};
 use windows::{
     Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
     Media::Ocr::{OcrEngine, OcrResult},
@@ -24,6 +31,8 @@ use windows_sys::Win32::{
 pub struct Reading {
     pub stats: Vec<String>,
     pub player: Option<Player>,
+    pub capture_ms: u64,
+    pub total_ms: u64,
 }
 
 #[derive(Clone)]
@@ -59,17 +68,69 @@ impl Drop for Apartment {
     }
 }
 
-pub fn read_ocr(pid: u32) -> Result<Reading, String> {
+type Request = (u32, SyncSender<Result<Reading, String>>);
+
+// Owns one OCR engine for the whole session. Creating the engine and its first
+// recognition is slow, so it runs at startup instead of during the first search.
+pub struct OcrWorker {
+    requests: Sender<Request>,
+}
+
+impl OcrWorker {
+    pub fn start() -> Self {
+        let (requests, inbox) = mpsc::channel::<Request>();
+        let spawned = thread::Builder::new().name("ocr".into()).spawn(move || {
+            let _apartment = Apartment::enter().ok();
+            let started = Instant::now();
+            let engine = OcrEngine::TryCreateFromUserProfileLanguages()
+                .map_err(|error| format!("OCR is unavailable. {error}"));
+            if let Ok(engine) = &engine {
+                // The first recognition loads language data, so pay that cost now.
+                let blank = vec![0u8; 64 * 16 * 4];
+                let _ = recognize(engine, &blank, 64, 16);
+            }
+            match &engine {
+                Ok(_) => diagnostic_log::info(&format!(
+                    "OCR engine ready in {} ms.",
+                    started.elapsed().as_millis()
+                )),
+                Err(error) => diagnostic_log::error(error),
+            }
+            for (pid, reply) in inbox {
+                let result = match &engine {
+                    Ok(engine) => read_ocr(engine, pid),
+                    Err(error) => Err(error.clone()),
+                };
+                let _ = reply.send(result);
+            }
+        });
+        if let Err(error) = spawned {
+            diagnostic_log::error(&format!("Could not start the OCR worker. {error}"));
+        }
+        Self { requests }
+    }
+
+    // If the worker has stopped, the reply channel disconnects and the caller reports it.
+    pub fn request(&self, pid: u32, reply: SyncSender<Result<Reading, String>>) {
+        let _ = self.requests.send((pid, reply));
+    }
+}
+
+fn read_ocr(engine: &OcrEngine, pid: u32) -> Result<Reading, String> {
+    let started = Instant::now();
     let frame = capture(pid).map_err(|error| error.to_string())?;
-    let _apartment = Apartment::enter().map_err(|error| error.to_string())?;
-    let engine =
-        OcrEngine::TryCreateFromUserProfileLanguages().map_err(|error| error.to_string())?;
+    let captured_in = started.elapsed();
     let captured = Instant::now();
     let image = RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.pixels)
         .ok_or("Game capture has invalid image dimensions.")?;
-    let stats = read_stat_panels(&engine, &image).map_err(|error| error.to_string())?;
-    let player = read_player(&engine, &image, &stats, captured);
-    Ok(Reading { stats, player })
+    let stats = read_stat_panels(engine, &image).map_err(|error| error.to_string())?;
+    let player = read_player(engine, &image, &stats, captured);
+    Ok(Reading {
+        stats,
+        player,
+        capture_ms: captured_in.as_millis() as u64,
+        total_ms: started.elapsed().as_millis() as u64,
+    })
 }
 
 fn read_stat_panels(engine: &OcrEngine, image: &RgbaImage) -> windows::core::Result<Vec<String>> {
