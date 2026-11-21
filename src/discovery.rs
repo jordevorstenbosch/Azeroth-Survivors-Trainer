@@ -135,7 +135,13 @@ impl Job {
                         if known_build { "is" } else { "is not" }
                     ));
                     let scan_started = Instant::now();
-                    let candidates = memory.scan(&character, &worker_cancel, known_build)?;
+                    let panel = worker_observation.lock().ok().and_then(|observed| {
+                        let player = observed.as_ref()?;
+                        (player.name.eq_ignore_ascii_case(&character)
+                            && player.captured.elapsed() <= Duration::from_secs(5))
+                            .then_some((player.health?, player.level?))
+                    });
+                    let candidates = memory.scan(&character, &worker_cancel, known_build, panel)?;
                     diagnostic_log::info(&format!(
                         "Memory scan found {} candidate records in {} ms.",
                         candidates.len(),
@@ -464,19 +470,53 @@ impl Memory {
         character: &str,
         cancel: &AtomicBool,
         known_build: bool,
+        panel: Option<(f32, u32)>,
     ) -> io::Result<Vec<(usize, usize, bool)>> {
         let stat_matches = AtomicUsize::new(0);
         let level_matches = AtomicUsize::new(0);
         let header_matches = AtomicUsize::new(0);
         let readable_names = AtomicUsize::new(0);
+        let panel_health_matches = AtomicUsize::new(0);
+        let panel_stat_matches = AtomicUsize::new(0);
+        let panel_level_before = AtomicUsize::new(0);
+        let panel_level_after = AtomicUsize::new(0);
+        let panel_stat_and_level_matches = AtomicUsize::new(0);
         let candidates = self.scan_chunks(cancel, |from, bytes, start, end, matching| {
             let mut chunk_stat_matches = 0;
             let mut chunk_level_matches = 0;
             let mut chunk_header_matches = 0;
             let mut chunk_readable_names = 0;
-            for offset in candidate_offsets(bytes, start, end, || chunk_stat_matches += 1) {
+            if let Some((health, level)) = panel {
+                for offset in (start.next_multiple_of(4)..end).step_by(4) {
+                    if !matches_panel_health(bytes, offset, health) {
+                        continue;
+                    }
+                    panel_health_matches.fetch_add(1, Ordering::Relaxed);
+                    if offset.checked_sub(LEVEL_DISTANCE).and_then(|at| read_u32(bytes, at)) == Some(level) {
+                        panel_level_before.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if offset.checked_add(LEVEL_DISTANCE).and_then(|at| read_u32(bytes, at)) == Some(level) {
+                        panel_level_after.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            for offset in candidate_offsets(bytes, start, end, |offset| {
+                chunk_stat_matches += 1;
+                if panel.is_some_and(|(health, _)| matches_panel_health(bytes, offset, health)) {
+                    panel_stat_matches.fetch_add(1, Ordering::Relaxed);
+                }
+            }) {
                 check_cancel(cancel)?;
                 chunk_level_matches += 1;
+                if panel.is_some_and(|(health, level)| {
+                    matches_panel_health(bytes, offset, health)
+                        && [offset.checked_sub(LEVEL_DISTANCE), offset.checked_add(LEVEL_DISTANCE)]
+                            .into_iter()
+                            .flatten()
+                            .any(|at| read_u32(bytes, at) == Some(level))
+                }) {
+                    panel_stat_and_level_matches.fetch_add(1, Ordering::Relaxed);
+                }
                 for (header, _, length) in name_headers(&bytes[..offset]) {
                     if length != character.len() {
                         continue;
@@ -509,6 +549,18 @@ impl Memory {
             readable_names.load(Ordering::Relaxed),
             candidates.len(),
         ));
+        if let Some((health, level)) = panel {
+            diagnostic_log::info(&format!(
+                "Panel correlation (HP {health}, level {level}): {} HP matches, {} pass the stat filter, {} have the exact level at -{LEVEL_DISTANCE}, {} at +{LEVEL_DISTANCE}, {} pass the stat filter and have the exact level at either position.",
+                panel_health_matches.load(Ordering::Relaxed),
+                panel_stat_matches.load(Ordering::Relaxed),
+                panel_level_before.load(Ordering::Relaxed),
+                panel_level_after.load(Ordering::Relaxed),
+                panel_stat_and_level_matches.load(Ordering::Relaxed),
+            ));
+        } else {
+            diagnostic_log::info("Panel correlation skipped: need a fresh reading with both HP and level.");
+        }
         Ok(candidates)
     }
 
@@ -726,11 +778,16 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
+fn matches_panel_health(bytes: &[u8], offset: usize, health: f32) -> bool {
+    read_u32(bytes, offset)
+        .is_some_and(|bits| (f32::from_bits(bits) - health).abs() <= 1.1)
+}
+
 fn candidate_offsets<'a>(
     bytes: &'a [u8],
     start: usize,
     end: usize,
-    mut on_stat_match: impl FnMut() + 'a,
+    mut on_stat_match: impl FnMut(usize) + 'a,
 ) -> impl Iterator<Item = usize> + 'a {
     // Use the 2.1.3 stat shape as a discovery hint. The two known level positions
     // cover the name-based and pattern-based layouts.
@@ -757,7 +814,7 @@ fn candidate_offsets<'a>(
             {
                 return false;
             }
-            on_stat_match();
+            on_stat_match(offset);
             [
                     offset.checked_sub(LEVEL_DISTANCE),
                     offset.checked_add(LEVEL_DISTANCE),
@@ -815,15 +872,15 @@ mod tests {
         }
         let mut stat_matches = 0;
         assert_eq!(
-            candidate_offsets(&bytes, position, position + 4, || stat_matches += 1).next(),
+            candidate_offsets(&bytes, position, position + 4, |_| stat_matches += 1).next(),
             None
         );
         assert_eq!(stat_matches, 1);
         let level = position + LEVEL_DISTANCE;
         bytes[level..level + 4].copy_from_slice(&3_u32.to_le_bytes());
-        assert_eq!(candidate_offsets(&bytes, 0, position, || {}).next(), None);
+        assert_eq!(candidate_offsets(&bytes, 0, position, |_| {}).next(), None);
         assert_eq!(
-            candidate_offsets(&bytes, position, bytes.len(), || {}).collect::<Vec<_>>(),
+            candidate_offsets(&bytes, position, bytes.len(), |_| {}).collect::<Vec<_>>(),
             [position]
         );
     }
