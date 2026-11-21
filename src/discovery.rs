@@ -813,7 +813,12 @@ mod tests {
         {
             slot.copy_from_slice(&stat.to_le_bytes());
         }
-        assert_eq!(candidate_offsets(&bytes, 0, bytes.len(), || {}).next(), None);
+        let mut stat_matches = 0;
+        assert_eq!(
+            candidate_offsets(&bytes, position, position + 4, || stat_matches += 1).next(),
+            None
+        );
+        assert_eq!(stat_matches, 1);
         let level = position + LEVEL_DISTANCE;
         bytes[level..level + 4].copy_from_slice(&3_u32.to_le_bytes());
         assert_eq!(candidate_offsets(&bytes, 0, position, || {}).next(), None);
