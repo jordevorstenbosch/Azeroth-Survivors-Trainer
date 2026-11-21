@@ -65,7 +65,6 @@ const LOCATE: u16 = 111;
 const STOP: u16 = 112;
 const MUTED_TEXT: u16 = 113;
 const STAT_CARD: u16 = 115;
-const OPEN_SETTINGS: u16 = 116;
 const PANEL_PROMPT: u16 = 118;
 const PROCESS_LOOKUP_LIMIT: u8 = 10;
 const BACKGROUND: u32 = rgb(22, 23, 30);
@@ -103,7 +102,6 @@ enum UpdateControl {
 
 struct Window {
     settings: Settings,
-    showing_settings: bool,
     children: Vec<Control>,
     render_cursor: usize,
     rendered_height: i32,
@@ -278,9 +276,7 @@ impl Window {
 
         let active_count = self.active_stats.iter().filter(|&&active| active).count() as i32;
         let rows = (active_count + 1) / 2;
-        let height = if self.showing_settings {
-            228
-        } else if self.shows_panel_prompt() {
+        let height = if self.shows_panel_prompt() {
             PANEL_PROMPT_HEIGHT
         } else if rows == 0 {
             228
@@ -313,11 +309,7 @@ impl Window {
             self.rendered_height = height;
         }
 
-        if self.showing_settings {
-            self.render_settings(hwnd);
-        } else {
-            self.render_overview(hwnd, rows);
-        }
+        self.render_overview(hwnd, rows);
         self.render_footer(hwnd, height);
         for control in self.children.drain(self.render_cursor..) {
             if !control.hwnd.is_null() {
@@ -350,8 +342,7 @@ impl Window {
 
     // The prompt stays up until every verified stat has been found and is frozen.
     fn shows_panel_prompt(&self) -> bool {
-        !self.showing_settings
-            && self.watching
+        self.watching
             && self.running
             && self.settings.game_path().is_some_and(game::valid_path)
             && matches!(
@@ -521,13 +512,7 @@ impl Window {
             self.text(hwnd, &status, [18, footer - 44, 464, 34], MUTED_TEXT);
         }
         self.text(hwnd, "", [18, footer - 8, 464, 1], DIVIDER);
-        let settings_label = if self.showing_settings {
-            "Back"
-        } else {
-            "Settings"
-        };
-        self.button(hwnd, settings_label, [18, footer, 82, 27], OPEN_SETTINGS);
-        self.button(hwnd, "GitHub Page", [110, footer, 106, 27], GITHUB);
+        self.button(hwnd, "GitHub Page", [18, footer, 106, 27], GITHUB);
         let (label, style) = match self.updater {
             UpdateControl::Ready => ("Check updates", 0),
             UpdateControl::Checking(_) => ("Checking..", WS_DISABLED),
@@ -552,14 +537,6 @@ impl Window {
             [400, footer + 4, 82, 21],
             MUTED_TEXT,
         );
-    }
-
-    fn render_settings(&mut self, hwnd: HWND) {
-        self.heading(hwnd, "Settings", [18, 17, 464, 30]);
-        if !self.message.is_empty() {
-            let message = self.message.clone();
-            self.text(hwnd, &message, [18, 117, 464, 38], MUTED_TEXT);
-        }
     }
 
     fn log(&self, message: &str) {
@@ -894,10 +871,6 @@ impl Window {
 
     fn command(&mut self, hwnd: HWND, command: u16) {
         match command {
-            OPEN_SETTINGS => {
-                self.showing_settings = !self.showing_settings;
-                self.message.clear();
-            }
             START | STOP | LOCATE => {
                 if !self.settings.game_path().is_some_and(game::valid_path)
                     && !self.choose_game(hwnd)
@@ -1190,7 +1163,6 @@ fn run() -> std::io::Result<()> {
         let dpi = GetDpiForSystem() as i32;
         let mut window = Window {
             settings,
-            showing_settings: false,
             children: Vec::new(),
             render_cursor: 0,
             rendered_height: 0,
