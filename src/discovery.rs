@@ -1,10 +1,8 @@
 use crate::{game, hud};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{self, Read, Seek},
-    path::{Path, PathBuf},
+    io,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -34,14 +32,7 @@ const STAT_BYTES: usize = 32;
 const LEVEL_DISTANCE: usize = 104;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const VERIFIED_BUILD: &str = "ba09f96a327cadc24371b9dd8d876418c8d6dde298847fab318847be8c44cc5a";
-const WRITER_RVA: usize = 0x5f7f01a;
-const WRITER_FILE_OFFSET: u64 = 0x5f7e41a;
-const WRITER_HASH: &str = "34ae43d72305c49c602a8194c0757a20753cf546c29d82b61d97001f50ffb50d";
-const NAME_DISTANCE: usize = 0x660 - 0x2a8;
-const NAME_OBJECT_OFFSET: usize = 0x2a8;
-const STAT_PACKET: &[u8] = b"AZS\x09hp=";
 const MAX_PACKET: usize = 1024;
-const HISTORICAL_NAME_DISTANCES: [usize; 3] = [NAME_DISTANCE, 912, 792];
 
 pub struct Target {
     pub name: &'static str,
@@ -119,7 +110,7 @@ impl Job {
     pub fn start(
         path: PathBuf,
         instance: game::ProcessInstance,
-        character: Option<String>,
+        character: String,
         observed: Option<hud::Player>,
     ) -> io::Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -139,35 +130,14 @@ impl Job {
                         build: build.clone(),
                         active: ActiveStats::default(),
                     }));
-                    let (actor, character, offsets) = if let Some(character) = character {
-                        let candidates = memory.scan(&character, &worker_cancel, known_build)?;
-                        let (actor, active) = memory.verify_actor(
-                            &candidates,
-                            &character,
-                            &worker_observation,
-                            &worker_cancel,
-                            known_build,
-                        )?;
-                        (actor, character, active)
-                    } else {
-                        let mut distances = vec![NAME_DISTANCE];
-                        if known_build {
-                            memory.verify_stat_writer(instance, &path)?;
-                        } else {
-                            let stat_base =
-                                memory.find_stat_writer(instance, &path, &worker_cancel)?;
-                            distances.extend_from_slice(&HISTORICAL_NAME_DISTANCES[1..]);
-                            if let Some(distance) = stat_base.checked_sub(NAME_OBJECT_OFFSET)
-                                && distance <= NAME_REACH
-                                && !distances.contains(&distance)
-                            {
-                                distances.push(distance);
-                            }
-                        }
-                        let (actor, character) =
-                            memory.verify_native_actor(&worker_cancel, known_build, &distances)?;
-                        (actor, character, CURRENT_OFFSETS.map(Some))
-                    };
+                    let candidates = memory.scan(&character, &worker_cancel, known_build)?;
+                    let (actor, offsets) = memory.verify_actor(
+                        &candidates,
+                        &character,
+                        &worker_observation,
+                        &worker_cancel,
+                        known_build,
+                    )?;
                     let writer = Memory::open(instance, true)?;
                     writer.freeze(
                         actor,
@@ -222,48 +192,6 @@ struct Actor {
 }
 
 impl Memory {
-    fn find_stat_writer(
-        &self,
-        instance: game::ProcessInstance,
-        path: &Path,
-        cancel: &AtomicBool,
-    ) -> io::Result<usize> {
-        let image = std::fs::read(path)?;
-        let (code, rva) = text_section(&image)
-            .ok_or_else(|| io::Error::other("The executable has no readable .text section."))?;
-        let (start, end, stat_base) = find_writer(code, cancel)?;
-        let address = game::module_base(instance.pid, path)?
-            .checked_add(rva)
-            .and_then(|base| base.checked_add(start))
-            .ok_or_else(|| io::Error::other("Invalid stat writer address."))?;
-        let mut loaded = vec![0; end - start];
-        self.read(address, &mut loaded)?;
-        if loaded != code[start..end] {
-            return Err(io::Error::other(
-                "The loaded stat writer differs from the game file.",
-            ));
-        }
-        Ok(stat_base as usize)
-    }
-
-    fn verify_stat_writer(&self, instance: game::ProcessInstance, path: &Path) -> io::Result<()> {
-        let mut file = File::open(path)?;
-        file.seek(io::SeekFrom::Start(WRITER_FILE_OFFSET))?;
-        let mut expected = [0; 350];
-        file.read_exact(&mut expected)?;
-        let mut loaded = [0; 350];
-        let address = game::module_base(instance.pid, path)?
-            .checked_add(WRITER_RVA)
-            .ok_or_else(|| io::Error::other("Invalid stat writer address."))?;
-        self.read(address, &mut loaded)?;
-        if loaded != expected || format!("{:x}", Sha256::digest(expected)) != WRITER_HASH {
-            return Err(io::Error::other(
-                "The loaded stat writer did not match the verified executable.",
-            ));
-        }
-        Ok(())
-    }
-
     fn open(instance: game::ProcessInstance, writable: bool) -> io::Result<Self> {
         let mut rights = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
         if writable {
@@ -532,84 +460,6 @@ impl Memory {
         Ok(matching)
     }
 
-    fn native_snapshot(
-        &self,
-        cancel: &AtomicBool,
-        known_build: bool,
-        distances: &[usize],
-    ) -> io::Result<(Vec<Actor>, Vec<NativeStats>)> {
-        let mut actors = Vec::new();
-        let mut packets = Vec::new();
-        self.scan_chunks(cancel, |from, bytes, start, end| {
-            for offset in candidate_offsets(bytes, start, end) {
-                check_cancel(cancel)?;
-                for header in distances
-                    .iter()
-                    .filter_map(|distance| offset.checked_sub(*distance))
-                {
-                    let header = from + header;
-                    if self.actor_name(header).is_err() {
-                        continue;
-                    }
-                    for &level_after_stats in if known_build {
-                        &[false][..]
-                    } else {
-                        &[false, true][..]
-                    } {
-                        if let Ok(actor) =
-                            self.actor_stats(from + offset, header, level_after_stats)
-                        {
-                            actors.push(actor);
-                        }
-                    }
-                }
-            }
-            for (offset, _) in bytes[start..end]
-                .iter()
-                .enumerate()
-                .filter(|(_, byte)| **byte == b'A')
-            {
-                let packet = &bytes[start + offset..];
-                if packet.starts_with(STAT_PACKET) {
-                    if let Some(stats) = native_stats(packet)
-                        && !packets.contains(&stats)
-                    {
-                        packets.push(stats);
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        Ok((actors, packets))
-    }
-
-    fn verify_native_actor(
-        &self,
-        cancel: &AtomicBool,
-        known_build: bool,
-        distances: &[usize],
-    ) -> io::Result<(Actor, String)> {
-        let deadline = Instant::now() + Duration::from_secs(35);
-        let mut previous = HashMap::new();
-        loop {
-            let (actors, packets) = self.native_snapshot(cancel, known_build, distances)?;
-            if let Some(selected) = native_actor(&previous, &actors, &packets) {
-                let name = self.actor_name(selected.header)?;
-                let current = self.actor(selected, &name)?;
-                if packets.iter().any(|packet| packet.matches(current)) {
-                    return Ok((current, name));
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::other(
-                    "Waiting for one live character to match the native stat feed. Gain experience in a solo run.",
-                ));
-            }
-            previous = actor_samples(actors);
-            thread::sleep(POLL_INTERVAL);
-        }
-    }
-
     fn scan_chunks(
         &self,
         cancel: &AtomicBool,
@@ -665,52 +515,6 @@ impl Memory {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct NativeStats {
-    health: f32,
-    stats: [f32; 4],
-}
-
-impl NativeStats {
-    fn matches(self, actor: Actor) -> bool {
-        (self.health - actor.health).abs() <= 0.51
-            && self
-                .stats
-                .into_iter()
-                .zip(actor.stats)
-                .all(|(expected, value)| (expected - value).abs() <= 0.0051)
-    }
-}
-
-fn native_stats(packet: &[u8]) -> Option<NativeStats> {
-    let payload = packet.strip_prefix(b"AZS\x09")?;
-    let payload = &payload[..payload.len().min(MAX_PACKET)];
-    let mut fields = payload.split(|&byte| byte == b';');
-    let mut read_field = |key: &str| {
-        let (label, value) = std::str::from_utf8(fields.next()?).ok()?.split_once('=')?;
-        if label != key {
-            return None;
-        }
-        let value = value.parse::<f32>().ok()?;
-        (0.0..=1e6).contains(&value).then_some(value)
-    };
-    let health = read_field("hp")?;
-    let damage = read_field("dmg")?;
-    for key in ["cd", "crit", "cm", "arm", "reg"] {
-        read_field(key)?;
-    }
-    let area = read_field("area")?;
-    for key in ["cnt", "echo", "spd", "pick", "xp"] {
-        read_field(key)?;
-    }
-    let luck = read_field("luck")?;
-    let gold = read_field("gold")?;
-    Some(NativeStats {
-        health,
-        stats: [damage, area, luck, gold],
-    })
-}
-
 type ActorSamples = HashMap<(usize, usize, bool), Actor>;
 
 fn actor_key(actor: Actor) -> (usize, usize, bool) {
@@ -731,18 +535,6 @@ fn progressed(previous: &ActorSamples, actor: Actor) -> bool {
                 && !actor.level_after_stats
                 && actor.experience > old.experience)
     })
-}
-
-fn native_actor(
-    previous: &ActorSamples,
-    actors: &[Actor],
-    packets: &[NativeStats],
-) -> Option<Actor> {
-    let mut live = actors.iter().copied().filter(|actor| {
-        progressed(previous, *actor) && packets.iter().any(|packet| packet.matches(*actor))
-    });
-    let actor = live.next()?;
-    live.next().is_none().then_some(actor)
 }
 
 fn panel_offsets(
@@ -828,113 +620,10 @@ fn unique_panel_match(
     matches.next().is_none().then_some(selected)
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        bytes.get(offset..offset + 2)?.try_into().ok()?,
-    ))
-}
-
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(offset..offset + 4)?.try_into().ok()?,
     ))
-}
-
-fn text_section(image: &[u8]) -> Option<(&[u8], usize)> {
-    if !image.starts_with(b"MZ") {
-        return None;
-    }
-    let pe = read_u32(image, 0x3c)? as usize;
-    if image.get(pe..pe + 4)? != b"PE\0\0" || read_u16(image, pe + 4)? != 0x8664 {
-        return None;
-    }
-    let count = read_u16(image, pe + 6)? as usize;
-    let table = pe + 24 + read_u16(image, pe + 20)? as usize;
-    for index in 0..count {
-        let section = image.get(table + index * 40..table + (index + 1) * 40)?;
-        if &section[..8] == b".text\0\0\0" {
-            let rva = read_u32(section, 12)? as usize;
-            let size = read_u32(section, 16)?.min(read_u32(section, 8)?) as usize;
-            let start = read_u32(section, 20)? as usize;
-            return Some((image.get(start..start + size)?, rva));
-        }
-    }
-    None
-}
-
-// Parse the memory operand of the SSE instructions used by the known stat writer.
-fn writer_operand(code: &[u8], start: usize, scalar: bool, opcode: u8) -> Option<(u8, u32, usize)> {
-    let mut cursor = start;
-    if scalar {
-        if *code.get(cursor)? != 0xf3 {
-            return None;
-        }
-        cursor += 1;
-    }
-    let rex = *code.get(cursor)?;
-    let extended = (0x40..=0x4f).contains(&rex);
-    cursor += usize::from(extended);
-    if code.get(cursor..cursor + 2)? != [0x0f, opcode] {
-        return None;
-    }
-    let mode = *code.get(cursor + 2)?;
-    let base = mode & 7;
-    if mode & 0xc0 != 0x80 || base == 4 {
-        return None;
-    }
-    let base = base + u8::from(extended && rex & 1 != 0) * 8;
-    Some((base, read_u32(code, cursor + 3)?, cursor + 7))
-}
-
-fn writer_end(code: &[u8], start: usize) -> Option<(usize, u32)> {
-    let (object, anchor, cursor) = writer_operand(code, start, true, 0x5c)?;
-    if !(0x100..=0x4000).contains(&anchor) {
-        return None;
-    }
-    let expected = [0, 4, 8, 12, 20, 24, 28, 32, 36, 40, 44, 48, 52];
-    let mut offsets = expected.into_iter();
-    let mut search = cursor;
-    while search < (start + 350).min(code.len()) {
-        let scalar = writer_operand(code, search, true, 0x11);
-        match scalar.or_else(|| writer_operand(code, search, false, 0x13)) {
-            Some((base, displacement, end)) if base == object => {
-                let offset = offsets.next()?;
-                if anchor.checked_add(offset)? != displacement || scalar.is_none() != (offset == 12)
-                {
-                    return None;
-                }
-                if offset == 52 {
-                    return Some((end, anchor));
-                }
-                search = end;
-            }
-            Some((_, _, end)) => search = end,
-            None => search += 1,
-        }
-    }
-    None
-}
-
-fn find_writer(code: &[u8], cancel: &AtomicBool) -> io::Result<(usize, usize, u32)> {
-    let mut found = None;
-    for (index, chunk) in code.chunks(CHUNK).enumerate() {
-        check_cancel(cancel)?;
-        for (offset, &byte) in chunk.iter().enumerate() {
-            if byte == 0xf3 {
-                let start = index * CHUNK + offset;
-                if let Some((end, stat_base)) = writer_end(code, start)
-                    && found.replace((start, end, stat_base)).is_some()
-                {
-                    return Err(io::Error::other(
-                        "Several code locations match the stat writer.",
-                    ));
-                }
-            }
-        }
-    }
-    found.ok_or_else(|| {
-        io::Error::other("Could not find the stat writer pattern in this game build.")
-    })
 }
 
 fn candidate_offsets(bytes: &[u8], start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
@@ -1139,46 +828,6 @@ mod tests {
     }
 
     #[test]
-    fn native_feed_requires_a_unique_progressing_character() {
-        let wire = b"AZS\x09hp=928;dmg=3.457;cd=0.533;crit=0.370;cm=3.82;arm=0.390;reg=8.21;area=1.358;cnt=2;echo=0.269;spd=1.577;pick=22.4;xp=1.00;luck=0.00;gold=1.31;heal=0.0;";
-        let packet = native_stats(wire).unwrap();
-        assert!(native_stats(&wire[4..]).is_none());
-        let live = Actor {
-            base: 1000,
-            header: 200,
-            level: 22,
-            experience: 70,
-            health: 928.4,
-            stats: [3.457, 1.358, 0.0, 1.31],
-            historical_area: 5.0,
-            level_after_stats: false,
-        };
-        let stale = Actor { base: 2000, ..live };
-        let previous = actor_samples(vec![
-            Actor {
-                experience: 68,
-                ..live
-            },
-            stale,
-        ]);
-        assert_eq!(
-            native_actor(&previous, &[live, stale], &[packet])
-                .unwrap()
-                .base,
-            live.base
-        );
-        assert!(native_actor(&previous, &[live, stale], &[]).is_none());
-        let both = [
-            live,
-            Actor {
-                experience: 71,
-                ..stale
-            },
-        ];
-        assert!(native_actor(&previous, &both, &[packet]).is_none());
-    }
-
-    #[test]
     fn unknown_build_discovers_damage_and_then_earlier_layout_offsets() {
         let mut player = hud::Player {
             name: "Hero".into(),
@@ -1213,24 +862,4 @@ mod tests {
         assert_eq!(panel_offsets(ambiguous, &player, false, bound), bound);
     }
 
-    #[test]
-    fn writer_search_accepts_relocated_code_and_rejects_duplicates() {
-        let base = 0x660_u32;
-        let mut code = vec![0x90; 32];
-        code.extend([0xf3, 0x0f, 0x5c, 0x87]);
-        code.extend(base.to_le_bytes());
-        for offset in [0, 4, 8, 12, 20, 24, 28, 32, 36, 40, 44, 48, 52] {
-            if offset == 12 {
-                code.extend([0x0f, 0x13, 0x87]);
-            } else {
-                code.extend([0xf3, 0x0f, 0x11, 0x87]);
-            }
-            code.extend((base + offset).to_le_bytes());
-        }
-        let cancel = AtomicBool::new(false);
-        assert_eq!(find_writer(&code, &cancel).unwrap(), (32, code.len(), base));
-        let duplicate = code.clone();
-        code.extend(duplicate);
-        assert!(find_writer(&code, &cancel).is_err());
-    }
 }

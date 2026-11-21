@@ -4,13 +4,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DetectionMode {
-    Ocr,
-    #[default]
-    ReadMemory,
-}
-
 pub struct Settings {
     pub directory: PathBuf,
     fields: Value,
@@ -54,7 +47,6 @@ impl Settings {
             "talent_cap",
             "auto_update",
             "gui_disabled",
-            "detection_mode",
         ] {
             if let Some(value) = source.get(key) {
                 fields[key] = value.clone();
@@ -86,22 +78,6 @@ impl Settings {
         self.save(updated)
     }
 
-    pub fn detection_mode(&self) -> DetectionMode {
-        match self.fields["detection_mode"].as_str() {
-            Some("ocr") => DetectionMode::Ocr,
-            _ => DetectionMode::default(),
-        }
-    }
-
-    pub fn set_detection_mode(&mut self, mode: DetectionMode) -> io::Result<()> {
-        let mut updated = self.fields.clone();
-        updated["detection_mode"] = json!(match mode {
-            DetectionMode::Ocr => "ocr",
-            DetectionMode::ReadMemory => "read_memory",
-        });
-        self.save(updated)
-    }
-
     fn save(&mut self, updated: Value) -> io::Result<()> {
         let destination = self.directory.join("settings.json");
         let temporary = self
@@ -117,22 +93,5 @@ impl Settings {
         }
         self.fields = updated;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detection_mode_defaults_to_read_memory_and_respects_explicit_ocr() {
-        let mut settings = Settings {
-            directory: PathBuf::new(),
-            fields: json!({}),
-        };
-        assert_eq!(settings.detection_mode(), DetectionMode::ReadMemory);
-
-        settings.fields["detection_mode"] = json!("ocr");
-        assert_eq!(settings.detection_mode(), DetectionMode::Ocr);
     }
 }

@@ -8,7 +8,7 @@ mod hud;
 mod settings;
 mod update;
 
-use settings::{DetectionMode, Settings};
+use settings::Settings;
 use std::{
     env,
     os::windows::ffi::{OsStrExt, OsStringExt},
@@ -61,9 +61,7 @@ const STOP: u16 = 112;
 const MUTED_TEXT: u16 = 113;
 const STAT_CARD: u16 = 115;
 const OPEN_SETTINGS: u16 = 116;
-const DETECTION_MODE: u16 = 117;
 const PROCESS_LOOKUP_LIMIT: u8 = 10;
-const READ_MEMORY_ATTEMPTS: u8 = 3;
 const BACKGROUND: u32 = rgb(22, 23, 30);
 const TEXT: u32 = rgb(242, 241, 247);
 const MUTED: u32 = rgb(172, 175, 192);
@@ -114,7 +112,6 @@ struct Window {
     build: Option<String>,
     discovery: Option<discovery::Job>,
     discovery_phase: DiscoveryPhase,
-    memory_discovery_failures: u8,
     active_stats: discovery::ActiveStats,
     discovery_message: String,
     next_discovery: Instant,
@@ -379,20 +376,9 @@ impl Window {
             match self.discovery_phase {
                 DiscoveryPhase::Searching => (
                     "Discovering stats",
-                    if self.detection_mode() == DetectionMode::ReadMemory {
-                        "Matching the live character to the game's stat messages."
-                    } else {
-                        "Looking for the live character record."
-                    },
+                    "Looking for the live character record.",
                 ),
-                DiscoveryPhase::WaitingForPanel => {
-                    let title = if self.memory_discovery_failures == READ_MEMORY_ATTEMPTS {
-                        "Using OCR"
-                    } else {
-                        "Finding your character"
-                    };
-                    (title, CHARACTER_PANEL_PROMPT)
-                }
+                DiscoveryPhase::WaitingForPanel => ("Finding your character", CHARACTER_PANEL_PROMPT),
                 DiscoveryPhase::Freezing => ("Stats frozen", ""),
                 DiscoveryPhase::Retrying => (
                     "Reconnecting",
@@ -410,7 +396,6 @@ impl Window {
         let detail = if configured
             && self.watching
             && self.running
-            && self.detection_mode() == DetectionMode::Ocr
             && matches!(
                 self.discovery_phase,
                 DiscoveryPhase::Searching
@@ -530,27 +515,6 @@ impl Window {
 
     fn render_settings(&mut self, hwnd: HWND) {
         self.heading(hwnd, "Settings", [18, 17, 464, 30]);
-        self.text(hwnd, "Detection Mode", [18, 71, 166, 24], 0);
-        let selector = self.child(
-            hwnd,
-            "COMBOBOX",
-            "",
-            WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
-            [192, 67, 290, 124],
-            DETECTION_MODE,
-        );
-        if !selector.is_null() {
-            unsafe {
-                if SendMessageW(selector, CB_GETCOUNT, 0, 0) == 0 {
-                    for label in ["OCR", "Read Memory"] {
-                        SendMessageW(selector, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
-                    }
-                    let selected =
-                        usize::from(self.settings.detection_mode() == DetectionMode::ReadMemory);
-                    SendMessageW(selector, CB_SETCURSEL, selected, 0);
-                }
-            }
-        }
         if !self.message.is_empty() {
             let message = self.message.clone();
             self.text(hwnd, &message, [18, 117, 464, 38], MUTED_TEXT);
@@ -665,9 +629,6 @@ impl Window {
                         .filter_map(|(target, active)| active.then_some(target.name))
                         .collect();
                     if !names.is_empty() {
-                        if self.detection_mode() == DetectionMode::ReadMemory {
-                            self.memory_discovery_failures = 0;
-                        }
                         (
                             DiscoveryPhase::Freezing,
                             format!("Freezing {} every 0.5 seconds.", names.join(", ")),
@@ -675,33 +636,24 @@ impl Window {
                     } else {
                         (
                             DiscoveryPhase::Searching,
-                            if self.detection_mode() == DetectionMode::ReadMemory {
-                                "Matching the live character to the game's stat messages.".into()
-                            } else {
-                                "Matching the live record to your character panel.".into()
-                            },
+                            "Matching the live record to your character panel.".into(),
                         )
                     }
                 }
                 Err(error) => return self.discovery_failed(&error.to_string()),
             })
         } else if Instant::now() >= self.next_discovery {
-            let name = if self.detection_mode() == DetectionMode::Ocr {
-                let name = self.solo_character.clone().or_else(|| {
-                    self.reading
-                        .player
-                        .as_ref()
-                        .map(|player| player.name.clone())
-                });
-                if name.is_none() {
-                    return self.set_discovery_status(
-                        DiscoveryPhase::WaitingForPanel,
-                        CHARACTER_PANEL_PROMPT.into(),
-                    );
-                }
-                name
-            } else {
-                None
+            let name = self.solo_character.clone().or_else(|| {
+                self.reading
+                    .player
+                    .as_ref()
+                    .map(|player| player.name.clone())
+            });
+            let Some(name) = name else {
+                return self.set_discovery_status(
+                    DiscoveryPhase::WaitingForPanel,
+                    CHARACTER_PANEL_PROMPT.into(),
+                );
             };
             match discovery::Job::start(
                 path.to_owned(),
@@ -724,40 +676,14 @@ impl Window {
         false
     }
 
-    fn detection_mode(&self) -> DetectionMode {
-        if self.memory_discovery_failures == READ_MEMORY_ATTEMPTS {
-            DetectionMode::Ocr
-        } else {
-            self.settings.detection_mode()
-        }
-    }
-
     fn discovery_failed(&mut self, error: &str) -> bool {
         self.discovery = None;
-        let was_freezing = self.active_stats.contains(&true);
         self.active_stats.fill(false);
         self.next_discovery = Instant::now() + Duration::from_secs(3);
-        let update = if self.detection_mode() == DetectionMode::ReadMemory && !was_freezing {
-            self.memory_discovery_failures += 1;
-            let attempts = self.memory_discovery_failures;
-            self.log(&format!(
-                "Read Memory attempt {attempts}/{READ_MEMORY_ATTEMPTS} failed. {error}"
-            ));
-            if attempts == READ_MEMORY_ATTEMPTS {
-                self.next_discovery = Instant::now();
-                self.log("Switching to OCR for this watcher session.");
-                return self.set_discovery_status(
-                    DiscoveryPhase::WaitingForPanel,
-                    CHARACTER_PANEL_PROMPT.into(),
-                );
-            }
-            format!(
-                "Read Memory attempt {attempts}/{READ_MEMORY_ATTEMPTS} failed. Keep gaining experience."
-            )
-        } else {
-            format!("Stat discovery will retry. {error}")
-        };
-        self.set_discovery_status(DiscoveryPhase::Retrying, update)
+        self.set_discovery_status(
+            DiscoveryPhase::Retrying,
+            format!("Stat discovery will retry. {error}"),
+        )
     }
 
     fn set_discovery_status(&mut self, phase: DiscoveryPhase, update: String) -> bool {
@@ -771,9 +697,6 @@ impl Window {
     }
 
     fn poll_hud(&mut self) {
-        if self.detection_mode() == DetectionMode::ReadMemory {
-            return;
-        }
         if let Some((generation, receiver)) = &self.capture {
             let generation = *generation;
             let result = match receiver.try_recv() {
@@ -826,7 +749,6 @@ impl Window {
         self.scan_generation = self.scan_generation.wrapping_add(1);
         self.discovery = None;
         self.discovery_phase = DiscoveryPhase::Searching;
-        self.memory_discovery_failures = 0;
         self.active_stats.fill(false);
         self.discovery_message.clear();
         self.next_discovery = Instant::now();
@@ -913,26 +835,6 @@ impl Window {
             OPEN_SETTINGS => {
                 self.showing_settings = !self.showing_settings;
                 self.message.clear();
-            }
-            DETECTION_MODE => {
-                let selector = unsafe { GetDlgItem(hwnd, i32::from(DETECTION_MODE)) };
-                let mode = match unsafe { SendMessageW(selector, CB_GETCURSEL, 0, 0) } {
-                    0 => DetectionMode::Ocr,
-                    1 => DetectionMode::ReadMemory,
-                    _ => return,
-                };
-                if mode != self.settings.detection_mode() {
-                    if let Err(error) = self.settings.set_detection_mode(mode) {
-                        self.message = format!("Could not save Detection Mode. {error}");
-                        let previous = usize::from(
-                            self.settings.detection_mode() == DetectionMode::ReadMemory,
-                        );
-                        unsafe { SendMessageW(selector, CB_SETCURSEL, previous, 0) };
-                    } else {
-                        self.message.clear();
-                        self.reset_scan();
-                    }
-                }
             }
             START | STOP | LOCATE => {
                 if !self.settings.game_path().is_some_and(game::valid_path)
@@ -1134,9 +1036,6 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LR
                 return 1;
             }
             WM_COMMAND if l != 0 => {
-                if w as u16 == DETECTION_MODE && (w >> 16) as u16 != CBN_SELCHANGE as u16 {
-                    return 0;
-                }
                 let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Window;
                 if let Some(data) = state.as_mut() {
                     // A file dialog can dispatch timer messages while this command runs.
@@ -1237,7 +1136,6 @@ fn run() -> std::io::Result<()> {
             build: None,
             discovery: None,
             discovery_phase: DiscoveryPhase::Searching,
-            memory_discovery_failures: 0,
             active_stats: discovery::ActiveStats::default(),
             discovery_message: String::new(),
             next_discovery: Instant::now(),

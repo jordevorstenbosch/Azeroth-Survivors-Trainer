@@ -2,6 +2,9 @@
 
 A standalone Rust trainer for the original Azeroth Survivors fan game on Windows x64.
 
+For the new **Azeroth Survivors: Reborn**, see the separate
+[Azeroth Survivor Reborn Trainer](../azeroth-survivors-reborn-trainer/README.md).
+
 ## Get started
 
 1. Download `AzerothSurvivorsTrainer.exe` from the [latest release](https://github.com/nelbin4/Azeroth-Survivors-Trainer/releases/latest).
@@ -11,18 +14,10 @@ A standalone Rust trainer for the original Azeroth Survivors fan game on Windows
 
 Use the trainer in solo runs or games you host. Gameplay testing covered solo runs.
 
-**Read Memory** is the default. It matches the game's native stat messages
-against the live player record as you gain experience. After three failed
-discovery attempts, the watcher switches to **OCR** for the current session and
-asks you to open the character panel. A new watcher session starts with your
-saved preference. You can choose **OCR** directly in **Settings → Detection Mode**.
-
-On an unfamiliar game build, Read Memory searches for the stat writer in the
-executable and matches the live record against the native stat messages. OCR
-checks the character name, gameplay progress and visible values against the
-documented stat layouts. Each verified stat starts freezing as soon as it is
-available. If the game's layout or messages change beyond what the watcher
-can verify, it keeps retrying.
+The watcher reads your character panel with **OCR**. It matches the character
+name, gameplay progress and visible values against the documented stat layouts.
+Each verified stat starts freezing as soon as it is available. If the game's
+layout changes beyond what the watcher can verify, it keeps retrying.
 
 ## Supported stats
 
